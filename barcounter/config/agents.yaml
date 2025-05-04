@@ -1,0 +1,12 @@
+# config/agents.yaml
+aggressive_bot:
+  params:
+    bluff_prob: 0.4
+    risk_tolerance: 0.8
+    min_raise: 2x
+
+conservative_bot:
+  params: 
+    bluff_prob: 0.1  
+    risk_tolerance: 0.3
+    min_raise: 1.5x
