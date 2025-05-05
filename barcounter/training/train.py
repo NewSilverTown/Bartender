@@ -211,7 +211,7 @@ class PPOTrainer:
                 discounted = discounted - mean
         return discounted
 
-    def train(self, epochs=5000):
+    def train(self, epochs=1000):
         """改进的训练循环"""
         best_loss = float('inf')
         
