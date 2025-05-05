@@ -20,7 +20,7 @@ def test_ai_vs_random(num_games=100):
         game = PokerGame(num_players=2)
         game.players[1].is_ai = True  # 设置第二个玩家为AI
         
-        while not game.is_terminal():
+        while not game.is_round_complete():
             if game.players[game.current_player].is_ai:
                 # AI决策（示例随机选择动作）
                 action = random.choice(list(ActionType))

@@ -38,3 +38,15 @@ class GameEncoder:
     def encode_stack(stack: int) -> np.array:
         """编码筹码量(归一化到0-1)"""
         return np.array([stack / 10000])  # 假设最大筹码量为10000
+    
+    @staticmethod
+    def encode_position(num_players, current_pos):
+        """编码玩家位置（按钮位重要性）"""
+        return [current_pos / num_players]
+
+    @staticmethod 
+    def encode_pot_odds(current_bet, pot_size):
+        """编码底池赔率"""
+        if pot_size == 0:
+            return [0.0]
+        return [current_bet / pot_size]
