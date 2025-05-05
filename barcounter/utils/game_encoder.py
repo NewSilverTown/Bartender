@@ -33,3 +33,8 @@ class GameEncoder:
         """编码公共牌（示例简化版）"""
         # 实际应使用更专业的扑克牌编码
         return np.zeros(169)  # 169维标准编码
+    
+    @staticmethod
+    def encode_stack(stack: int) -> np.array:
+        """编码筹码量(归一化到0-1)"""
+        return np.array([stack / 10000])  # 假设最大筹码量为10000

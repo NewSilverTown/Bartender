@@ -7,14 +7,14 @@ import torch
 
 def testpolicy():
     model = PokerPolicyNet()
-    model.load_state_dict(torch.load("models/poker_policy.pt"))
+    model.load_state_dict(torch.load("models/best_policy.pt"))
     print("模型加载成功！输入维度:", model.net[0].in_features)  # 应输出182
     print("输出维度:", model.net[-1].out_features)        # 应输出4
 
 def actiontest():
     model = PokerPolicyNet()
     # 生成模拟输入
-    test_input = torch.randn(1, 182)  # 随机生成合法状态
+    test_input = torch.randn(1, 183)  # 随机生成合法状态
     probs = torch.softmax(model(test_input), dim=1)
     print("动作概率分布:", probs)
     # 期望输出示例: tensor([[0.12, 0.33, 0.48, 0.07]])
