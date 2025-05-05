@@ -44,7 +44,6 @@ class PokerPolicyNet(nn.Module):
             nn.Dropout(0.2)
         )
         
-        # 动作类型预测头
         self.action_type_head = nn.Sequential(
             nn.Linear(128, 64),
             nn.ELU(),
@@ -59,6 +58,13 @@ class PokerPolicyNet(nn.Module):
             nn.Sigmoid()
         )
 
+        self.value_head = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.ELU(),
+            nn.Linear(64, 1)
+        )
+
+
     def forward(self, state, legal_mask):
         # 状态特征提取
         state_feat = self.state_encoder(state)
@@ -66,16 +72,20 @@ class PokerPolicyNet(nn.Module):
         # 动作类型预测（修复掩码处理）
         action_logits = self.action_type_head(state_feat)
         
-        # 将非法动作logits设为负无穷
-        masked_logits = action_logits.masked_fill(
-            legal_mask == 0, -torch.inf
-        )
+        # 确保legal_mask是张量且类型正确
+        if legal_mask is None:
+            legal_mask = torch.ones_like(action_logits).bool()
+            masked_logits = action_logits.masked_fill(legal_mask == 0, -torch.inf)
+        else:
+            masked_logits = action_logits
+
         action_probs = F.softmax(masked_logits, dim=1)
-        
         # 加注金额预测
         raise_ratio = self.raise_head(state_feat)
+
+        state_value = self.value_head(state_feat)
         
-        return action_probs, raise_ratio
+        return action_probs, raise_ratio.squeeze(-1), state_value
 
     def predict(self, state, legal_actions):
         # 生成合法动作掩码（修复版）
@@ -91,7 +101,7 @@ class PokerPolicyNet(nn.Module):
                 legal_mask[idx] = 1.0
         
         with torch.no_grad():
-            action_probs, raise_ratio = self(
+            action_probs, raise_ratio, _ = self(  # 忽略value输出
                 state.unsqueeze(0),
                 legal_mask.unsqueeze(0)
             )

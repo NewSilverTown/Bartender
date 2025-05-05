@@ -89,30 +89,47 @@ class ActionDistributionAnalyzer:
         self.reset_stats()
         
         for _ in tqdm(range(num_games), desc="Analyzing games"):
-            self.game.reset()
+            self.game = PokerGame(self.num_players)  # 每次创建新游戏
             current_sequence = []
+            max_steps = 1000  # 添加安全计数器
             
-            while not self.game.is_terminal():
+            while not self.game.is_terminal() and max_steps > 0:
+                max_steps -= 1
                 player = self.game.players[self.game.current_player]
-                if not player.is_in_hand:
+                
+                # 处理弃牌玩家
+                if not player.is_in_hand or player.is_all_in:
+                    self.game._advance_to_next_player()  # 使用内部方法推进
                     continue
                 
-                # 获取状态和合法动作
+                # 获取状态和动作
                 state = self._encode_state()
-                legal_actions = self._get_legal_actions(self.game)
+                legal_actions = self.game.get_legal_actions()  # 使用游戏自带方法
                 
                 # 模型预测
-                with torch.no_grad():
-                    action_info = self.model.predict(state.to(self.device), legal_actions)
-                
-                # 记录数据
-                self._record_action(action_info, legal_actions)
-                current_sequence.append(action_info['action']['type'].name)
+                try:
+                    with torch.no_grad():
+                        action_info = self.model.predict(state.to(self.device), legal_actions)
+                except Exception as e:
+                    print(f"预测失败: {str(e)}")
+                    break
                 
                 # 执行动作
-                self._execute_action(action_info['action'])
+                if action_info and 'action' in action_info:
+                    self._record_action(action_info, legal_actions)
+                    current_sequence.append(action_info['action']['type'].name)
+                    self._execute_action(action_info['action'])
+                    
+                    # 推进阶段检查
+                    if self.game.is_round_complete():
+                        self.game.next_phase()
+                else:
+                    print("无效的动作信息")
+                    break
             
             self.stats['action_sequences'].append(current_sequence)
+            if max_steps <= 0:
+                print("达到最大步数限制，强制终止游戏")
         
         return self.generate_report()
 
@@ -120,17 +137,54 @@ class ActionDistributionAnalyzer:
         """简化的状态编码（与训练代码一致）"""
         player = self.game.players[self.game.current_player]
         state = np.zeros(256, dtype=np.float32)
+
+        ranks = ['2','3','4','5','6','7','8','9','T','J','Q','K','A']
+        suits = ['h','d','c','s']
         
         # 手牌编码
         hand_encoded = np.zeros(52)
         for card in player.hand:
-            idx = (13 * ['2','3','4','5','6','7','8','9','T','J','Q','K','A'].index(card[0]) + \
-                  ['h','d','c','s'].index(card[1]))
-            hand_encoded[idx] = 1
+            card = card.upper().strip()
+            if len(card) < 2:
+                continue
+
+            try:
+                rank_idx = ranks.index(card[0])
+                suit_idx = suits.index(card[1].lower())
+            except ValueError:
+                continue
+            
+            idx = rank_idx * 4 + suit_idx  # 正确计算索引（0-51）
+            if 0 <= idx < 52:
+                hand_encoded[idx] = 1
+        
         state[:52] = hand_encoded
         
+        # 公共牌编码（同样需要修正）
+        max_community = 3
+        community_encoded = np.zeros(52 * max_community)
+        for i, card in enumerate(self.game.community_cards[:max_community]):
+            try:
+                rank_idx = ranks.index(card[0].upper())
+                suit_idx = suits.index(card[1].lower())
+                idx = rank_idx * 4 + suit_idx
+                if 0 <= idx < 52:
+                    community_encoded[i*52 + idx] = 1
+            except:
+                continue
+        
+        state[52:52+len(self.game.community_cards)*52] = community_encoded[:len(self.game.community_cards)*52]
+        
+        # 数值特征
+        state[-4:] = [
+            player.stack / 1000.0,
+            player.current_bet / 1000.0,
+            sum(p.current_bet for p in self.game.players) / 2000.0,
+            self.game.game_phase / 3.0
+        ]
+
         # 游戏阶段
-        state[-1] = self.game.game_phase / 3.0
+        # state[-1] = self.game.game_phase / 3.0
         return torch.FloatTensor(state)
 
     def _record_action(self, action_info, legal_actions):
@@ -160,7 +214,8 @@ class ActionDistributionAnalyzer:
         # 按游戏阶段统计
         phase_name = ['Pre-flop', 'Flop', 'Turn', 'River'][phase]
         self.stats['phase_stats'][phase_name][action['type'].name] += 1
-        
+
+        player = self.game.players[self.game.current_player]        
         # 按筹码量统计
         stack_level = min(2, player.stack // 500)  # 0-500, 500-1000, 1000+
         self.stats['stack_level_stats'][stack_level][action['type'].name] += 1
@@ -168,12 +223,23 @@ class ActionDistributionAnalyzer:
     def _execute_action(self, action):
         """执行动作的简化版本"""
         try:
+            # 执行前备份当前玩家索引
+            prev_player = self.game.current_player
+            
             if action['type'] == ActionType.RAISE:
                 self.game.apply_action(action['type'], raise_amount=action['amount'])
             else:
                 self.game.apply_action(action['type'])
+            
+            # 验证玩家索引是否变化
+            if self.game.current_player == prev_player:
+                print("玩家索引未变化，强制推进")
+                self.game._advance_to_next_player()
+                
         except Exception as e:
             print(f"执行动作失败: {str(e)}")
+            # 强制推进玩家索引
+            self.game._advance_to_next_player()
 
     def generate_report(self):
         """生成分析报告"""
@@ -277,7 +343,7 @@ class ActionDistributionAnalyzer:
 
 if __name__ == "__main__":
     analyzer = ActionDistributionAnalyzer()
-    report = analyzer.analyze(num_games=1000)
+    report = analyzer.analyze(num_games=50)
     analyzer.plot_distributions(report)
     
     # 打印关键指标
