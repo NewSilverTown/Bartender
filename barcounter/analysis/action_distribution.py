@@ -12,22 +12,22 @@ project_root = current_dir.parent
 sys.path.append(str(project_root))
 
 import torch
-from models.policy_net import PokerPolicyNet, load_model
+from models.policy_net import PokerPolicyNet,StateEncoder, load_model
 from utils.game_simulator import PokerGame, ActionType
 
 class ActionDistributionAnalyzer:
-    def __init__(self, model_path="models/poker_policy.pt"):
+    def __init__(self, model_path="checkpoints/model_400.pt"):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = load_model(model_path).to(self.device)
-        self.model.eval()
-        
-        # 初始化统计数据
-        self.reset_stats()
         
         # 游戏模拟器用于生成分析数据
         self.num_players = 6
         self.game = PokerGame(self.num_players)
-        
+
+        self.model = load_model(model_path).to(self.device)
+        self.encoder = StateEncoder(num_players=self.num_players)
+        # 初始化统计数据
+        self.reset_stats()
+
     def reset_stats(self):
         """重置所有统计计数器"""
         self.stats = {
@@ -108,30 +108,48 @@ class ActionDistributionAnalyzer:
                     self.game._advance_to_next_player()  # 使用内部方法推进
                     continue
                 
-                # 获取状态和动作
-                state = self._encode_state()
-                legal_actions = self.game.get_legal_actions()  # 使用游戏自带方法
-                
                 # 模型预测
                 try:
+                    # 获取状态和动作
+                    state = self.encoder.encode(self.game, self.game.current_player)
+                    legal_actions = self.game.get_legal_actions()  # 使用游戏自带方法
                     with torch.no_grad():
-                        action_info = self.model.predict(state.to(self.device), legal_actions)
+                        action_info = self.model.predict(self.game, self.game.current_player)
                 except Exception as e:
                     print(f"预测失败: {str(e)}")
                     break
                 
-                # 执行动作
-                if action_info and 'action' in action_info:
+                required_keys = {'type', 'raise_amount', 'probs'}
+                if not all(k in action_info for k in required_keys):
+                    print(f"无效的动作信息结构: {action_info.keys()}")
+                    break
+
+                # 执行并记录动作（修正键名）
+                try:
                     self._record_action(action_info, legal_actions)
-                    current_sequence.append(action_info['action']['type'].name)
-                    self._execute_action(action_info['action'])
+                    current_sequence.append(action_info['type'].name)
                     
+                    # 执行动作（使用正确参数）
+                    if action_info['type'] == ActionType.RAISE:
+                        self.game.apply_action(
+                            action_info['type'], 
+                            raise_amount=action_info['raise_amount']
+                        )
+                    else:
+                        self.game.apply_action(action_info['type'])
+                        
                     # 推进阶段检查
                     if self.game.is_round_complete():
                         self.game.next_phase()
-                else:
-                    print("无效的动作信息")
+                        
+                except Exception as e:
+                    import traceback
+                    print(f"执行动作失败详情:")
+                    traceback.print_exc()  # 打印完整堆栈跟踪
+                    print(f"当前动作信息: {action_info}")
                     break
+
+                self.game._advance_to_next_player()
             
             self.stats['action_sequences'].append(current_sequence)
             if max_steps <= 0:
@@ -139,83 +157,34 @@ class ActionDistributionAnalyzer:
         
         return self.generate_report()
 
-    def _encode_state(self):
+    def _encode_state(self, player_index):
         """简化的状态编码（与训练代码一致）"""
-        player = self.game.players[self.game.current_player]
-        state = np.zeros(256, dtype=np.float32)
-
-        ranks = ['2','3','4','5','6','7','8','9','T','J','Q','K','A']
-        suits = ['h','d','c','s']
-        
-        # 手牌编码
-        hand_encoded = np.zeros(52)
-        for card in player.hand:
-            card = card.upper().strip()
-            if len(card) < 2:
-                continue
-
-            try:
-                rank_idx = ranks.index(card[0])
-                suit_idx = suits.index(card[1].lower())
-            except ValueError:
-                continue
-            
-            idx = rank_idx * 4 + suit_idx  # 正确计算索引（0-51）
-            if 0 <= idx < 52:
-                hand_encoded[idx] = 1
-        
-        state[:52] = hand_encoded
-        
-        # 公共牌编码（同样需要修正）
-        max_community = 3
-        community_encoded = np.zeros(52 * max_community)
-        for i, card in enumerate(self.game.community_cards[:max_community]):
-            try:
-                rank_idx = ranks.index(card[0].upper())
-                suit_idx = suits.index(card[1].lower())
-                idx = rank_idx * 4 + suit_idx
-                if 0 <= idx < 52:
-                    community_encoded[i*52 + idx] = 1
-            except:
-                continue
-        
-        state[52:52+len(self.game.community_cards)*52] = community_encoded[:len(self.game.community_cards)*52]
-        
-        # 数值特征
-        state[-4:] = [
-            player.stack / 1000.0,
-            player.current_bet / 1000.0,
-            sum(p.current_bet for p in self.game.players) / 2000.0,
-            self.game.game_phase / 3.0
-        ]
-
-        # 游戏阶段
-        # state[-1] = self.game.game_phase / 3.0
-        return torch.FloatTensor(state)
+        return self.encoder.encode(self.game, player_index)
 
     def _record_action(self, action_info, legal_actions):
         """记录单次动作数据"""
-        action = action_info['action']
+        action_type = action_info['type']
         probs = action_info['probs']
-        phase = self.game.game_phase
+        phase = self.game.get_phase_name()
         
         # 基础统计
         self.stats['total_decisions'] += 1
-        self.stats['action_counts'][action['type'].name] += 1
+        self.stats['action_counts'][action_type.name] += 1
         
         # 记录所有动作的概率（包括不可用动作）
         full_probs = {a['type'].name: 0.0 for a in legal_actions}
         for k, v in probs.items():
             full_probs[k] = v
 
-        for action_type in full_probs:
-            self.stats['action_probs'][action_type].append(full_probs[action_type])
+        for action_type_name in full_probs:
+            self.stats['action_probs'][action_type_name].append(full_probs[action_type_name])
         
         # 记录RAISE比例
-        if action['type'] == ActionType.RAISE:
-            min_raise = action['min']
-            max_raise = action['max']
-            actual_ratio = (action['amount'] - min_raise) / (max_raise - min_raise + 1e-8)
+        if action_type == ActionType.RAISE:
+            legal_raise = next(a for a in legal_actions if a['type'] == ActionType.RAISE)
+            min_raise = legal_raise['min']
+            max_raise = legal_raise['max']
+            actual_ratio = (action_info['raise_amount'] - min_raise) / (max_raise - min_raise + 1e-8)
             self.stats['raise_ratios'].append(actual_ratio)
         
         # 按游戏阶段统计
@@ -226,12 +195,12 @@ class ActionDistributionAnalyzer:
             3: 'River'
         }
         phase_name = phase_map.get(phase, f'Unknown Phase ({phase})')
-        self.stats['phase_stats'][phase_name][action['type'].name] += 1
+        self.stats['phase_stats'][phase_name][action_type.name] += 1
 
         player = self.game.players[self.game.current_player]        
         # 按筹码量统计
         stack_level = min(2, player.stack // 500)  # 0-500, 500-1000, 1000+
-        self.stats['stack_level_stats'][stack_level][action['type'].name] += 1
+        self.stats['stack_level_stats'][stack_level][action_type.name] += 1
 
     def _execute_action(self, action):
         """执行动作的简化版本"""
@@ -252,7 +221,7 @@ class ActionDistributionAnalyzer:
         except Exception as e:
             print(f"执行动作失败: {str(e)}")
             # 强制推进玩家索引
-            self.game._advance_to_next_player()
+            self.game.force_terminate()
 
     def generate_report(self):
         """生成分析报告"""

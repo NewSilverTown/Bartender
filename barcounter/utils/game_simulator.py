@@ -2,6 +2,7 @@ from typing import List, Dict, Optional
 import random
 from enum import Enum
 from collections import defaultdict
+from itertools import combinations
 
 class ActionType(Enum):
     FOLD = 0
@@ -57,6 +58,7 @@ class PokerGame:
         # 检查是否所有玩家都all-in
         all_all_in = all(p.is_all_in for p in self.players if p.is_in_hand)
         return all_all_in
+    
     def force_terminate(self):
         """强制终止游戏"""
         for p in self.players:
@@ -81,12 +83,6 @@ class PokerGame:
             p.total_bet = 0
             p.is_in_hand = True
             p.is_all_in = False
-
-        # Deal hands
-        for p in self.players:
-            p.hand = [self.deck.pop(), self.deck.pop()]
-
-        self._post_blinds()
 
     def _post_blinds(self):
         sb_pos = (self.current_player + 1) % self.num_players
@@ -186,9 +182,16 @@ class PokerGame:
         elif action_type == ActionType.RAISE:
             if player.stack <= 0:
                 raise ValueError("零筹码玩家不能加注")
+                
             current_max = max(p.current_bet for p in self.players if p.is_in_hand)
-            min_raise = max(self.big_blind, current_max + self.big_blind)
-            raise_amount = max(min_raise, raise_amount)
+            min_raise = max(
+                self.big_blind,
+                current_max + self.big_blind - player.current_bet
+            )
+            if raise_amount < min_raise:
+                raise ValueError(f"加注必须至少 {min_raise}")
+            
+
             available = player.stack + player.current_bet
             actual_raise = min(raise_amount, available)
             self._place_bet(self.current_player, actual_raise)
@@ -199,15 +202,11 @@ class PokerGame:
 
     def _advance_to_next_player(self):
         start_idx = self.current_player
-        max_attempts = self.num_players * 2  # 添加最大尝试次数
-        while max_attempts > 0:
-            max_attempts -= 1
+        for _ in range(self.num_players):
             self.current_player = (self.current_player + 1) % self.num_players
             player = self.players[self.current_player]
             if player.is_in_hand and not player.is_all_in:
-                break
-            if self.current_player == start_idx:
-                break
+                return
         self.force_terminate()
 
     def is_round_complete(self) -> bool:
@@ -243,25 +242,25 @@ class PokerGame:
 
     def _calculate_side_pots(self) -> List[Dict]:
         sorted_players = sorted(
-            [p for p in self.players if p.total_bet > 0],
+        {p.total_bet: p for p in self.players if p.total_bet > 0}.values(),
             key=lambda x: x.total_bet
         )
         
         pots = []
         prev_total = 0
-        for i, player in enumerate(sorted_players):
+        for player in sorted_players:
             current_total = player.total_bet
             if current_total <= prev_total:
                 continue
                 
             contribution = current_total - prev_total
-            eligible_players = [p for p in sorted_players[i:] if p.is_in_hand]
+            eligible = [p for p in self.players if p.total_bet >= current_total]
             
-            if eligible_players:
-                pot_size = contribution * len(sorted_players[i:])
+            if eligible:
+                pot_size = contribution * len(eligible)
                 pots.append({
                     "amount": pot_size,
-                    "players": eligible_players
+                    "players": eligible
                 })
                 prev_total = current_total
         
@@ -269,24 +268,80 @@ class PokerGame:
 
     # 改进的牌力评估方法
     def _determine_winners(self, candidates: List[Player]) -> List[Player]:
-        def evaluate_hand(hand: List[str], community: List[str]) -> int:
-            # 简化的牌力评估（实际需要完整实现）
-            all_cards = hand + community
-            ranks = sorted(['23456789TJQKA'.index(c[0]) for c in all_cards], reverse=True)
-            return max(ranks[:5])  # 暂时用最高牌判断
+        def evaluate_hand(hand: List[str], community: List[str]):
+            # 将牌转换为数值格式 (rank, suit)
+            rank_map = {'2': 2, '3': 3, '4': 4, '5': 5, '6': 6, 
+                    '7': 7, '8': 8, '9': 9, 'T': 10, 'J': 11, 
+                    'Q': 12, 'K': 13, 'A': 14}
+            all_cards = [(rank_map[c[0]], c[1]) for c in hand + community]
+            
+            # 生成所有可能的5张组合
+            best_rank = (0, [])
+            for combo in combinations(all_cards, 5):
+                ranks = sorted([c[0] for c in combo], reverse=True)
+                suits = [c[1] for c in combo]
+                
+                # 检查同花和顺子
+                flush = len(set(suits)) == 1
+                straight = (max(ranks) - min(ranks) == 4 and len(set(ranks))) == 5
+                straight_ace_low = set(ranks) == {14, 2, 3, 4, 5}
+                
+                # 牌型判断
+                count = {r: ranks.count(r) for r in set(ranks)}
+                pairs = sorted([r for r in count if count[r] == 2], reverse=True)
+                trips = [r for r in count if count[r] == 3]
+                quads = [r for r in count if count[r] == 4]
+                full_house = len(trips) >= 1 and len(pairs) >= 1
+                
+                # 牌型分级
+                if flush and straight:
+                    if max(ranks) == 14:  # 皇家同花顺
+                        rank = (9, [])
+                    else:  # 普通同花顺
+                        rank = (8, [max(ranks)])
+                elif quads:
+                    rank = (7, quads, [r for r in ranks if r != quads[0]])
+                elif full_house:
+                    rank = (6, [trips[0], pairs[0]])
+                elif flush:
+                    rank = (5, sorted(ranks, reverse=True))
+                elif straight or straight_ace_low:
+                    if straight_ace_low:
+                        high = 5
+                    else:
+                        high = max(ranks)
+                    rank = (4, [high])
+                elif trips:
+                    rank = (3, trips, sorted([r for r in ranks if r not in trips], reverse=True))
+                elif len(pairs) >= 2:
+                    rank = (2, pairs[:2], sorted([r for r in ranks if r not in pairs[:2]], reverse=True))
+                elif len(pairs) == 1:
+                    rank = (1, pairs, sorted([r for r in ranks if r not in pairs], reverse=True))
+                else:
+                    rank = (0, sorted(ranks, reverse=True))
+                
+                if rank > best_rank:
+                    best_rank = rank
+            
+            return best_rank
 
-        best_score = -1
+        best_hand = None
         winners = []
         for player in candidates:
-            score = evaluate_hand(player.hand, self.community_cards)
-            if score > best_score:
-                best_score = score
+            current_rank = evaluate_hand(player.hand, self.community_cards)
+            if not best_hand or current_rank > best_hand:
+                best_hand = current_rank
                 winners = [player]
-            elif score == best_score:
+            elif current_rank == best_hand:
                 winners.append(player)
+        
         return winners
 
     def settle_round(self) -> Dict[int, int]:
+
+        for p in self.players:
+            p.total_bet = p.current_bet  # 确保total_bet包含当前回合下注
+        
         side_pots = self._calculate_side_pots()
         results = defaultdict(int)
 
@@ -303,5 +358,12 @@ class PokerGame:
                 winner.stack += amount
                 results[id(winner)] += amount
 
-        self._reset_round()
+        self.reset()
         return dict(results)
+    
+    def reset_players_stack(self, stacks: List[int]):
+        """强制设置玩家筹码（测试用）"""
+        for i, stack in enumerate(stacks):
+            self.players[i].stack = stack
+            self.players[i].is_in_hand = True
+            self.players[i].is_all_in = False

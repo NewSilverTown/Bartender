@@ -15,388 +15,258 @@ import numpy as np
 from tqdm import tqdm
 from collections import deque,defaultdict
 import torch.nn.functional as F
-from models.policy_net import PokerPolicyNet, save_model
+from models.policy_net import PokerPolicyNet,StateEncoder
 from utils.game_simulator import PokerGame, ActionType
 
 class PPOTrainer:
-    def __init__(self, num_players=6):
+    def __init__(self, config):
+        self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = PokerPolicyNet(state_dim=256).to(self.device)
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=3e-5, weight_decay=1e-5)
-        self.gamma = 0.99
-        self.lam = 0.95
-        self.eps_clip = 0.2
-        self.batch_size = 512
-        self.num_players = num_players
-        self.memory = deque(maxlen=100000)
-        self.episode_cache = []
-        self.entropy_coef = 0.01
-        self.gae_lambda = 0.95
-        self.clip_range = 0.2
-        self.normalize_advantages = True
         
-        # 自适应学习率调度器
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, 
-            mode='min',  # 监控损失
-            patience=3, 
-            factor=0.5
+        # 初始化环境和模型
+        self.game = PokerGame(num_players=config['num_players'])
+        self.encoder = StateEncoder(num_players=config['num_players'])
+        self.policy_net = PokerPolicyNet(
+            input_dim=self.encoder.encode(self.game, 0).shape[0]
+        ).to(self.device)
+        self.policy_net = self.policy_net.float()
+        
+        # 优化器和配置
+        self.optimizer = optim.AdamW(
+            self.policy_net.parameters(),
+            lr=config['learning_rate'],
+            weight_decay=config['weight_decay']
         )
+        
+        # 经验缓冲区
+        self.buffer = deque(maxlen=config['buffer_size'])
+        
+        # 创建模型保存目录
+        os.makedirs(config['save_dir'], exist_ok=True)
 
-    def collect_experience(self, num_episodes):
-        """改进的经验收集方法，包含动态奖励计算"""
-        self.episode_cache = []
+        assert self.policy_net.feature_net[0].in_features == self.encoder.encode(self.game, 0).shape[0], "状态编码维度与网络输入维度不匹配"
 
-        for _ in tqdm(range(num_episodes), desc="Collecting"):
-            game = PokerGame(num_players=self.num_players)
-            episode = []
-            final_rewards = None
-            max_steps = 1000  # 添加最大步数限制
-
-            while not game.is_terminal() and max_steps > 0:
-                max_steps -= 1
-                current_player = game.current_player
-                player = game.players[current_player]
-                if not player.is_in_hand:
+    def collect_experience(self):
+        """收集多局游戏经验"""
+        
+        for _ in range(self.config['episodes_per_update']):
+            self.game.reset()
+            episode_data = []
+            done = False
+            
+            while not done:
+                current_player = self.game.current_player
+                if not self.game.players[current_player].is_in_hand:
                     continue
-
-                # 添加筹码状态监控
-                if player.stack < 0:
-                    raise ValueError(f"玩家{player}出现负筹码：{player.stack}")
                 
-                # 获取游戏状态
-                state = self._encode_state(game)
-                legal_actions = game.get_legal_actions()
+                # 编码当前状态
+                state = self.encoder.encode(self.game, current_player).float()
+                legal_actions = self.game.get_legal_actions()
                 
                 # 模型预测
                 with torch.no_grad():
-                    action_info = self.model.predict(state, legal_actions)
-                    action_idx = self._action_to_index(action_info['action']['type'], legal_actions)
+                    action_probs, raise_ratio, value = self.policy_net(
+                        state.unsqueeze(0).to(self.device),
+                        self._get_legal_mask(legal_actions).to(self.device)
+                    )
+                
+                # 选择动作
+                action_type, action_info, action_idx = self._select_action(
+                    action_probs[0].cpu(), 
+                    raise_ratio[0].item(),
+                    legal_actions
+                )
                 
                 # 执行动作
-                immediate_reward = self._execute_action(game, action_info['action'])
-                episode.append((
-                    state, 
-                    action_idx, 
-                    immediate_reward, 
-                    legal_actions))
+                prev_pot = self.game.pot
+                self.game.apply_action(action_type, action_info.get('amount', 0))
+                reward = self._calculate_reward(current_player, prev_pot)
+                done = self.game.is_terminal()
+                
+                # 存储经验（新增action_idx）
+                episode_data.append({
+                    'state': state,
+                    'action_probs': action_probs[0].cpu(),
+                    'action_idx': action_idx,  # 新增动作索引
+                    'value': value[0].cpu(),
+                    'reward': reward,
+                    'legal_actions': legal_actions
+                })
             
-            if max_steps <= 0:
-                print("达到最大步数限制，强制终止游戏")
-                game.force_terminate()  # 需要在PokerGame添加该方法
-
-            if not game.is_terminal():
-                # 处理未终局的情况
-                final_rewards = self._calculate_final_rewards(game)
-            else:
-                # 获取实际结算奖励
-                final_rewards = game.settle_round() 
+            # 计算折扣回报
+            self._process_episode(episode_data)
+        
+    def train(self):
+        """训练循环"""
+        for update in range(self.config['max_updates']):
+            self.collect_experience()
             
-
-            for i, (state, action_idx, _, legal_actions) in enumerate(episode):
-                player_id = game.current_player  # 需要跟踪玩家ID
-                episode[i] = (state, action_idx, final_rewards.get(player_id, 0), legal_actions)
-            
-            # 计算优势值
-            self._process_episode_with_gae(episode)
-            self.episode_cache.extend(episode)
-
-            if num_episodes % 10 == 0:
-                # 检查玩家筹码状态
-                for p in game.players:
-                    assert p.stack >= 0, f"玩家{p}出现负筹码：{p.stack}"
-                    
-                # 检查动作分布
-                action_counts = defaultdict(int)
-                for exp in self.memory:
-                    action_counts[exp[1]] += 1
-                print(f"动作分布：{dict(action_counts)}")
-
-    def _process_episode_with_gae(self, episode):
-        """使用GAE计算优势值"""
-        states = [t[0] for t in episode]
-        actions = [t[1] for t in episode]
-        rewards = [t[2] for t in episode]
-        
-        # 计算价值估计
-        with torch.no_grad():
-            states_tensor = torch.stack(states).to(self.device)
-            _, _, values = self.model(states_tensor, None)
-            values = values.cpu().numpy().flatten()
-            next_values = np.append(values[1:], 0.0)  # 添加终止状态值
-        
-        # GAE计算
-        advantages = np.zeros_like(rewards)
-        last_advantage = 0
-        for t in reversed(range(len(rewards))):
-            delta = float(rewards[t]) + self.gamma * float(next_values[t]) - float(values[t])
-            advantages[t] = delta + self.gamma * self.gae_lambda * last_advantage
-            last_advantage = advantages[t]
-        
-        returns = advantages + values
-        
-        # 标准化优势（保持原有逻辑）
-        if self.normalize_advantages:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
-        # 存储经验
-        for state, action, adv, ret in zip(states, actions, advantages, returns):
-            self.memory.append((
-                state,
-                action,
-                torch.tensor(adv, dtype=torch.float32),
-                torch.tensor(ret, dtype=torch.float32)
-            ))
-    
-    def _action_to_index(self, action_type, legal_actions):
-        """将动作类型转换为合法动作列表中的索引"""
-        for idx, a in enumerate(legal_actions):
-            if a['type'] == action_type:
-                return idx
-        raise ValueError(f"非法动作类型: {action_type}")
-
-    def _process_episode(self, episode):
-        """处理经验并存入内存"""
-        states = [t[0] for t in episode]
-        actions = [t[1] for t in episode]
-        rewards = [t[2] for t in episode]
-        
-        # 计算优势值（确保维度正确）
-        returns = []
-        R = 0
-        for r in reversed(rewards):
-            R = r + self.gamma * R
-            returns.insert(0, R)
-        
-        returns = torch.tensor(returns, dtype=torch.float32)
-        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
-        
-        # 存入内存
-        for state, action, ret in zip(states, actions, returns):
-            self.memory.append((
-                state,          # [256]
-                action,         # scalar
-                ret             # scalar
-            ))
-
-    def train(self, epochs=100):
-        """改进的训练循环，包含课程学习"""
-        if len(self.memory) < self.batch_size:
-                print("初始化经验池...")
-                self.collect_experience(num_episodes=self.batch_size//2)
-
-        for epoch in range(epochs):
-            if len(self.memory) < self.batch_size:
-                print(f"内存不足 ({len(self.memory)}/{self.batch_size}), 继续收集...")
-                print("初始化经验池...")
-                self.collect_experience(num_episodes=max(10, self.batch_size//20))  # 动态调整收集量
+            if len(self.buffer) < self.config['batch_size']:
+                print(f"跳过更新 {update}: 缓冲区不足 ({len(self.buffer)}/{self.config['batch_size']})")
                 continue
-
-            # 采样批次数据
-            batch = random.sample(self.memory, self.batch_size)
+                
+            # 从缓冲区采样
+            batch = random.sample(self.buffer, self.config['batch_size'])
             
-            # 正确解包数据
-            states = torch.stack([t[0] for t in batch]).to(self.device)   # [batch, 256]
-            actions = torch.LongTensor([t[1] for t in batch]).to(self.device) 
-            advantages = torch.FloatTensor([t[2] for t in batch]).to(self.device)
-            returns = torch.FloatTensor([t[3] for t in batch]).to(self.device)
+            # 转换为张量（新增动作索引）
+            states = torch.stack([x['state'].float() for x in batch]).to(self.device)
+            old_probs = torch.stack([x['action_probs'].float() for x in batch]).to(self.device)
+            actions = torch.tensor([x['action_idx'] for x in batch], dtype=torch.long).to(self.device)
+            returns = torch.tensor([x['return'] for x in batch], dtype=torch.float32).to(self.device)
+            values = torch.stack([x['value'].float() for x in batch]).to(self.device)
             
-            # 模型前向
-            action_probs, raise_ratios, values = self.model(
-                states, 
-                legal_mask=None  # 假设模型已处理mask
-            )
+            # 计算优势
+            advantages = returns - values.squeeze()
             
-            # 计算损失
-            dist = torch.distributions.Categorical(action_probs)
-            log_probs = dist.log_prob(actions)
-            entropy = dist.entropy().mean()
+            # 计算损失（修复gather参数）
+            new_probs, _, new_values = self.policy_net(states.float())
             
-            # 计算新旧策略比例
-            old_action_probs = action_probs.gather(1, actions.unsqueeze(1)).squeeze()
-            ratios = torch.exp(log_probs - old_action_probs.detach())
+            # 正确使用gather方法
+            ratio = (new_probs.gather(1, actions.unsqueeze(1)) / 
+                (old_probs.gather(1, actions.unsqueeze(1)) + 1e-8))
             
-            # 策略损失
-            surr1 = ratios * advantages
-            surr2 = torch.clamp(ratios, 1-self.clip_range, 1+self.clip_range) * advantages
+            # PPO损失计算
+            surr1 = ratio * advantages.unsqueeze(1)
+            surr2 = torch.clamp(ratio, 1-self.config['clip_epsilon'], 
+                            1+self.config['clip_epsilon']) * advantages.unsqueeze(1)
             policy_loss = -torch.min(surr1, surr2).mean()
             
             # 价值损失
-            value_loss = F.mse_loss(values.squeeze(), returns)
+            value_loss = F.mse_loss(new_values.squeeze(), returns)
             
             # 熵正则化
-            entropy_loss = -self.entropy_coef * entropy
+            entropy = -(new_probs * torch.log(new_probs + 1e-6)).mean()
             
-            # 总损失
-            total_loss = policy_loss + 0.5 * value_loss + entropy_loss
+            total_loss = (policy_loss 
+                        + self.config['value_coeff'] * value_loss
+                        - self.config['entropy_coeff'] * entropy)
             
             # 反向传播
             self.optimizer.zero_grad()
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 
+                                         self.config['max_grad_norm'])
             self.optimizer.step()
             
-            self.entropy_coef *= 0.995  # 逐步减少探索
-            # 打印日志
-            if epoch % 50 == 0 and epoch > 0:
-                self.batch_size = min(self.batch_size*2, 4096)
-                print(f"Epoch {epoch} | Loss: {total_loss.item():.3f}")
+            # 保存模型
+            if update % self.config['save_interval'] == 0:
+                self._save_model(update)
+                
+            # 打印训练信息
+            if update % self.config['log_interval'] == 0:
+                print(f"Update {update}: Loss={total_loss.item():.2f} "
+                      f"PolicyLoss={policy_loss.item():.2f} "
+                      f"ValueLoss={value_loss.item():.2f}")
 
-    def _calculate_final_rewards(self, game):
-        """根据最终筹码变化计算奖励"""
-        initial_stack = 1000  # 初始筹码量
-        rewards = {}
-        for idx, player in enumerate(game.players):
-            # 筹码变化作为最终奖励
-            delta = (player.stack - initial_stack) / initial_stack  # 归一化
-            rewards[idx] = delta * 2  # 放大奖励信号
-        return rewards
-    
-    def _encode_state(self, game):
-        """修复后的状态编码"""
-        player = game.get_current_player()
-        state = np.zeros(256, dtype=np.float32)
+    def _calculate_reward(self, player_idx, prev_pot):
+        """计算即时奖励"""
+        # 简单奖励设计：筹码变化 + 存活奖励
+        player = self.game.players[player_idx]
+        reward = 0.0
         
-        # 手牌编码（确保索引正确）
-        for card in player.hand:
-            rank = card[0].upper()
-            suit = card[1].lower()
-            rank_idx = '23456789TJQKA'.index(rank)
-            suit_idx = ['h','d','c','s'].index(suit)
-            idx = rank_idx * 4 + suit_idx  # 正确计算0-51索引
-            state[idx] = 1
-        
-        return torch.tensor(state, device=self.device)
-
-    def _card_to_index(self, card):
-        ranks = '23456789TJQKA'
-        suits = 'hdcs'
-        return (ranks.index(card[0]) * 4) + suits.index(card[1])
-    
-    def _create_legal_mask(self, legal_actions):
-            """生成合法动作的掩码"""
-            action_types = [
-                ActionType.FOLD,
-                ActionType.CHECK_CALL, 
-                ActionType.RAISE,
-                ActionType.ALL_IN
-            ]
-            mask = torch.zeros(len(action_types), dtype=torch.float32)
+        # 存活奖励
+        if player.is_in_hand:
+            reward += 0.02
             
-            try:
-                for action in legal_actions:
-                    if action['available']:
-                        idx = action_types.index(action['type'])
-                        mask[idx] = 1.0
-            except ValueError as e:
-                print(f"非法动作类型: {action['type']}")
-                print(f"合法动作列表: {[a['type'] for a in legal_actions]}")
-                raise
-            
-            return mask.to(self.device)
-    
-    def _get_legal_actions(self, game):
-        """生成合法动作列表"""
-        player = game.players[game.current_player]
-        actions = []
+        # 筹码变化
+        reward += (player.stack - 1000) / 1000  # 初始筹码为1000
         
-        # Fold
-        actions.append({
-            'type': ActionType.FOLD,
-            'available': True,
-            'min': 0,
-            'max': 0
-        })
+        # 激进奖励
+        if player.current_bet > 0:
+            bet_ratio = player.current_bet / (player.stack + player.current_bet + 1e-8)
+            reward += bet_ratio * 0.5
         
-        # Check/Call
-        call_amount = max(p.current_bet for p in game.players) - player.current_bet
-        actions.append({
-            'type': ActionType.CHECK_CALL,
-            'available': call_amount <= player.stack,
-            'min': call_amount,
-            'max': call_amount
-        })
-        
-        # Raise
-        min_raise = max(game.big_blind, 
-                      max(p.current_bet for p in game.players) + game.big_blind)
-        max_raise = player.stack
-        actions.append({
-            'type': ActionType.RAISE,
-            'available': max_raise >= min_raise,
-            'min': min_raise,
-            'max': max_raise,
-            'player_stack': player.stack
-        })
-        
-        # All-in
-        actions.append({
-            'type': ActionType.ALL_IN,
-            'available': player.stack > 0,
-            'min': player.stack,
-            'max': player.stack
-        })
-        
-        return [a for a in actions if a['available']]
+        if player.current_bet > prev_pot:
+            reward += 0.3 * (player.current_bet - prev_pot) / 1000
 
-    def _execute_action(self, game, action):
-        """执行动作并计算奖励"""
-        player = game.players[game.current_player]
-        prev_stack = player.stack
+        if self.game.is_terminal():
+            if player.stack > 1000:  # 初始筹码为1000
+                reward += (player.stack - 1000) / 500  # 胜利奖励系数提高
+            else:
+                reward -= (1000 - player.stack) / 1000  # 失败惩
         
-        try:
-            # 执行动作前校验
-            if action['type'] in [ActionType.RAISE, ActionType.ALL_IN]:
-                if player.stack <= 0:
-                    raise ValueError(f"玩家{game.current_player}零筹码时尝试{action['type'].name}")
+        #--------------------------
+        # 阶段奖励（鼓励参与）
+        # --------------------------
+        if self.game.game_phase > 0:  # Flop之后
+            if player.is_in_hand:
+                reward += 0.1 * self.game.game_phase  # 越后期奖励越高
 
-            # 精确执行动作
-            if action['type'] == ActionType.FOLD:
-                game.apply_action(ActionType.FOLD)
-            elif action['type'] == ActionType.CHECK_CALL:
-                game.apply_action(ActionType.CHECK_CALL)
-            elif action['type'] == ActionType.RAISE:
-                # 确保金额在合法范围内
-                amount = np.clip(action['amount'], action['min'], action['max'])
-                game.apply_action(ActionType.RAISE, raise_amount=amount)
-            elif action['type'] == ActionType.ALL_IN:
-                game.apply_action(ActionType.ALL_IN)
-            
-        except Exception as e:
-            print(f"执行动作失败: {str(e)}")
-            return 0
+        return float(reward)
+
+    def _process_episode(self, episode_data):
+        """计算折扣回报"""
+        gamma = self.config['gamma']
+        running_return = 0
         
-        # 计算风险惩罚（带安全防护）
-        risk_penalty = 0
-        try:
-            if action['type'] == ActionType.ALL_IN:
-                risk_penalty = -0.1
-            elif action['type'] == ActionType.RAISE:
-                current_stack = max(player.stack, 1e-8)  # 防止除零
-                risk_ratio = action['amount'] / current_stack
-                risk_penalty = -0.05 * risk_ratio
-        except:
-            risk_penalty = -0.05  # 异常情况默认惩罚
-        # 验证下注结果
-        current_bet = player.current_bet
-        # print(f"执行动作: {action['type'].name}, 当前下注: {current_bet}")  # 调试输出
+        # 反向计算
+        for t in reversed(range(len(episode_data))):
+            running_return = episode_data[t]['reward'] + gamma * running_return
+            self.buffer.append({
+                **episode_data[t],
+                'return': running_return
+            })
+
+    def _get_legal_mask(self, legal_actions):
+        """生成合法动作掩码"""
+        mask = torch.zeros(4)
+        action_types = [ActionType.FOLD, ActionType.CHECK_CALL, 
+                       ActionType.RAISE, ActionType.ALL_IN]
+        for action in legal_actions:
+            if action['available']:
+                idx = action_types.index(action['type'])
+                mask[idx] = 1.0
+        return mask
+
+    def _select_action(self, probs, raise_ratio, legal_actions):
+        """根据概率选择动作"""
+        valid_actions = [a for a in legal_actions if a['available']]
+        action_idx = torch.multinomial(probs, 1).item()
+        action_type = [ActionType.FOLD, ActionType.CHECK_CALL, 
+                      ActionType.RAISE, ActionType.ALL_IN][action_idx]
         
-        # 计算基于筹码变化的奖励
-        stack_change = player.stack - prev_stack
-        immediate_reward = stack_change / 1000.0  # 归一化
+        # 处理加注金额
+        action_info = {}
+        if action_type == ActionType.RAISE:
+            legal_raise = next(a for a in valid_actions 
+                              if a['type'] == ActionType.RAISE)
+            min_raise = legal_raise['min']
+            max_raise = legal_raise['max']
+            amount = min_raise + (max_raise - min_raise) * raise_ratio
+            action_info['amount'] = int(amount)
         
-        reward_value = immediate_reward + risk_penalty
-        
-        return float(reward_value)  # 严格限制奖励范围
+        return action_type, action_info, action_idx  
+
+    def _save_model(self, step):
+        """保存模型检查点"""
+        path = f"{self.config['save_dir']}/model_{step}.pt"
+        torch.save({
+            'model_state': self.policy_net.state_dict(),
+            'optimizer_state': self.optimizer.state_dict(),
+            'step': step,
+            'input_dim': self.policy_net.feature_net[0].in_features  # 新增关键参数
+        }, path)
+        print(f"Saved model checkpoint at step {step}")
 
 if __name__ == "__main__":
-    trainer = PPOTrainer()
-    trainer.train(epochs=500)
-    save_model(trainer.model, path="models/poker_policy.pt")
-    # try:
-    #     trainer.train(epochs=1000)
-    #     save_model(trainer.model, path="models/poker_policy.pt")
-    # except Exception as e:
-    #     print(f"训练异常终止: {str(e)}")
-    #     # 保存崩溃前的模型
-    #     save_model(trainer.model, path="models/crash_recovery.pt")
+    config = {
+        'num_players': 6,
+        'learning_rate': 3e-4,
+        'weight_decay': 1e-5,
+        'buffer_size': 100000,
+        'batch_size': 256,
+        'gamma': 0.99,
+        'clip_epsilon': 0.3,
+        'value_coeff': 0.5,
+        'entropy_coeff': 0.1,
+        'max_grad_norm': 0.5,
+        'episodes_per_update': 50,
+        'max_updates': 500,
+        'save_dir': "checkpoints",
+        'save_interval': 100,
+        'log_interval': 10,
+        'input_dim': 128    
+    }
+    
+    trainer = PPOTrainer(config)
+    trainer.train()
