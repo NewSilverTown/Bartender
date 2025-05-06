@@ -51,8 +51,18 @@ class PokerGame:
     def is_terminal(self):
         """判断游戏是否结束（新增方法）"""
         active_players = [p for p in self.players if p.is_in_hand]
-        return len(active_players) <= 1
-    
+        if len(active_players) <= 1:
+            return True
+        
+        # 检查是否所有玩家都all-in
+        all_all_in = all(p.is_all_in for p in self.players if p.is_in_hand)
+        return all_all_in
+    def force_terminate(self):
+        """强制终止游戏"""
+        for p in self.players:
+            p.is_in_hand = False
+        self.pot = 0  # 清空奖池
+
     def _create_deck(self) -> List[str]:
         ranks = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A']
         suits = ['h', 'd', 'c', 's']
@@ -174,6 +184,8 @@ class PokerGame:
             call_amount = self._get_call_amount()
             self._place_bet(self.current_player, call_amount)
         elif action_type == ActionType.RAISE:
+            if player.stack <= 0:
+                raise ValueError("零筹码玩家不能加注")
             current_max = max(p.current_bet for p in self.players if p.is_in_hand)
             min_raise = max(self.big_blind, current_max + self.big_blind)
             raise_amount = max(min_raise, raise_amount)
@@ -187,13 +199,16 @@ class PokerGame:
 
     def _advance_to_next_player(self):
         start_idx = self.current_player
-        while True:
+        max_attempts = self.num_players * 2  # 添加最大尝试次数
+        while max_attempts > 0:
+            max_attempts -= 1
             self.current_player = (self.current_player + 1) % self.num_players
             player = self.players[self.current_player]
             if player.is_in_hand and not player.is_all_in:
                 break
             if self.current_player == start_idx:
                 break
+        self.force_terminate()
 
     def is_round_complete(self) -> bool:
         active_players = [p for p in self.players if p.is_in_hand and not p.is_all_in]
@@ -203,9 +218,18 @@ class PokerGame:
         current_bets = [p.current_bet for p in self.players if p.is_in_hand]
         return len(set(current_bets)) == 1
 
+    def get_phase_name(self):
+        phase_map = {
+            0: 'Pre-flop',
+            1: 'Flop',
+            2: 'Turn',
+            3: 'River'
+        }
+        return phase_map.get(self.game_phase, 'Showdown')
+    
     def next_phase(self):
-        for p in self.players:
-            p.current_bet = 0
+        if self.game_phase >= 3:  # River之后不再推进阶段
+            return
         self.game_phase += 1
         
         cards_to_deal = {

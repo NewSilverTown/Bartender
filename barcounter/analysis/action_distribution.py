@@ -44,6 +44,8 @@ class ActionDistributionAnalyzer:
         """从训练代码复制的合法动作生成逻辑"""
         player = game.players[game.current_player]
         actions = []
+        current_max_bet = max(p.current_bet for p in game.players)
+        call_amount = current_max_bet - player.current_bet
         
         # Fold
         actions.append({
@@ -54,30 +56,34 @@ class ActionDistributionAnalyzer:
         })
         
         # Check/Call
-        call_amount = max(p.current_bet for p in game.players) - player.current_bet
+        can_call = (call_amount <= player.stack) and (call_amount >= 0)
         actions.append({
             'type': ActionType.CHECK_CALL,
-            'available': call_amount <= player.stack,
+            'available': can_call,
             'min': call_amount,
             'max': call_amount
         })
         
         # Raise
-        min_raise = max(game.big_blind, 
-                      max(p.current_bet for p in game.players) + game.big_blind)
+        min_raise = max(
+        game.big_blind,
+        current_max_bet + game.big_blind - player.current_bet
+        )
         max_raise = player.stack
+        can_raise = (max_raise >= min_raise) and (player.stack > 0)
         actions.append({
             'type': ActionType.RAISE,
-            'available': max_raise >= min_raise,
+            'available': can_raise,
             'min': min_raise,
             'max': max_raise,
             'player_stack': player.stack
         })
         
         # All-in
+        can_all_in = (player.stack > 0) and not can_raise
         actions.append({
             'type': ActionType.ALL_IN,
-            'available': player.stack > 0,
+            'available': can_all_in,
             'min': player.stack,
             'max': player.stack
         })
@@ -201,6 +207,7 @@ class ActionDistributionAnalyzer:
         full_probs = {a['type'].name: 0.0 for a in legal_actions}
         for k, v in probs.items():
             full_probs[k] = v
+
         for action_type in full_probs:
             self.stats['action_probs'][action_type].append(full_probs[action_type])
         
@@ -212,7 +219,13 @@ class ActionDistributionAnalyzer:
             self.stats['raise_ratios'].append(actual_ratio)
         
         # 按游戏阶段统计
-        phase_name = ['Pre-flop', 'Flop', 'Turn', 'River'][phase]
+        phase_map = {
+            0: 'Pre-flop',
+            1: 'Flop',
+            2: 'Turn',
+            3: 'River'
+        }
+        phase_name = phase_map.get(phase, f'Unknown Phase ({phase})')
         self.stats['phase_stats'][phase_name][action['type'].name] += 1
 
         player = self.game.players[self.game.current_player]        
@@ -343,7 +356,7 @@ class ActionDistributionAnalyzer:
 
 if __name__ == "__main__":
     analyzer = ActionDistributionAnalyzer()
-    report = analyzer.analyze(num_games=50)
+    report = analyzer.analyze(num_games=500)
     analyzer.plot_distributions(report)
     
     # 打印关键指标

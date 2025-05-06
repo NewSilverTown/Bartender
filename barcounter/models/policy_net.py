@@ -34,31 +34,39 @@ class PokerPolicyNet(nn.Module):
         super().__init__()
         # 状态编码器保持不变
         self.state_encoder = nn.Sequential(
-            nn.Linear(state_dim, 256),
+            nn.Linear(state_dim, 512),
+            nn.LayerNorm(512),
+            nn.ELU(),
+            nn.Dropout(0.4),
+            nn.Linear(512, 256),
             nn.LayerNorm(256),
             nn.ELU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, 128),
-            nn.LayerNorm(128),
-            nn.ELU(),
-            nn.Dropout(0.2)
+            nn.Dropout(0.3)
         )
         
+        # 改进动作头结构
         self.action_type_head = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ELU(),
             nn.Linear(128, 64),
             nn.ELU(),
             nn.Linear(64, 4)
         )
         
-        # 加注金额预测头
+        # 加注金额预测头增加复杂度
         self.raise_head = nn.Sequential(
-            nn.Linear(128, 32),
+            nn.Linear(256, 64),
+            nn.ELU(),
+            nn.Linear(64, 32),
             nn.ELU(),
             nn.Linear(32, 1),
             nn.Sigmoid()
         )
 
+        # 价值网络增强
         self.value_head = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ELU(),
             nn.Linear(128, 64),
             nn.ELU(),
             nn.Linear(64, 1)
@@ -72,10 +80,11 @@ class PokerPolicyNet(nn.Module):
         # 动作类型预测（修复掩码处理）
         action_logits = self.action_type_head(state_feat)
         
-        # 确保legal_mask是张量且类型正确
-        if legal_mask is None:
-            legal_mask = torch.ones_like(action_logits).bool()
-            masked_logits = action_logits.masked_fill(legal_mask == 0, -torch.inf)
+        # 改进掩码处理
+        if legal_mask is not None:
+            legal_mask = legal_mask.to(action_logits.device)
+            inf_mask = torch.clamp(torch.log(legal_mask), min=-torch.inf, max=torch.inf)
+            masked_logits = action_logits + inf_mask
         else:
             masked_logits = action_logits
 
@@ -90,14 +99,17 @@ class PokerPolicyNet(nn.Module):
     def predict(self, state, legal_actions):
         # 生成合法动作掩码（修复版）
         legal_mask = torch.zeros(4, dtype=torch.float)
+        action_types = [ActionType.FOLD, ActionType.CHECK_CALL, 
+                   ActionType.RAISE, ActionType.ALL_IN]
+        
         for action in legal_actions:
+            if action['type'] == ActionType.RAISE:
+                # 确保最小加注量不超过剩余筹码
+                actual_min = min(action['min'], action['player_stack'])
+                actual_max = min(action['max'], action['player_stack'])
+                action['available'] = (actual_max >= actual_min) and (action['player_stack'] > 0)
             if action['available']:
-                idx = [
-                    ActionType.FOLD, 
-                    ActionType.CHECK_CALL,
-                    ActionType.RAISE, 
-                    ActionType.ALL_IN
-                ].index(action['type'])
+                idx = action_types.index(action['type'])
                 legal_mask[idx] = 1.0
         
         with torch.no_grad():
@@ -110,38 +122,34 @@ class PokerPolicyNet(nn.Module):
         available_actions = [a for a in legal_actions if a['available']]
         available_types = [a['type'] for a in available_actions]
         
+        valid_probs = action_probs[0][legal_mask.bool()]
+        valid_probs /= valid_probs.sum()
+
         # 提取对应概率
-        probs = []
-        for action_type in available_types:
-            idx = [
-                ActionType.FOLD, 
-                ActionType.CHECK_CALL,
-                ActionType.RAISE, 
-                ActionType.ALL_IN
-            ].index(action_type)
-            probs.append(action_probs[0, idx].item())
-        
-        # 概率归一化（安全处理）
-        probs = np.array(probs, dtype=np.float32)
-        probs /= probs.sum()  # 强制归一化
+        probs_dict = {}
+        for idx, prob in enumerate(valid_probs):
+            action_type = action_types[legal_mask.nonzero()[idx].item()]
+            probs_dict[action_type.name] = prob.item()
         
         # 选择动作
-        selected_idx = np.random.choice(len(probs), p=probs)
-        selected_action = available_actions[selected_idx]
+        selected_idx = torch.multinomial(valid_probs, 1).item()
+        selected_type = action_types[legal_mask.nonzero()[selected_idx].item()]
         
-        # 计算加注金额
-        if selected_action['type'] == ActionType.RAISE:
-            min_raise = selected_action['min']
-            max_raise = selected_action['max']
-            ratio = raise_ratio.item()
-            amount = min_raise + (max_raise - min_raise) * ratio
-            selected_action['amount'] = int(np.clip(amount, min_raise, max_raise))
-        
-        return {
-            'action': selected_action,
-            'probs': dict(zip([a['type'].name for a in available_actions], probs)),
+        # 构建action_info
+        action_info = {
+            'action': next(a for a in legal_actions if a['type'] == selected_type),
+            'probs': probs_dict,
             'raise_ratio': raise_ratio.item()
         }
+
+        # 计算加注金额
+        if selected_type == ActionType.RAISE:
+            min_raise = action_info['action']['min']
+            max_raise = action_info['action']['max']
+            amount = min_raise + (max_raise - min_raise) * raise_ratio.item()
+            action_info['action']['amount'] = int(np.clip(amount, min_raise, max_raise))
+        
+        return action_info
 
 # 新增模型保存加载函数
 def save_model(model, path="models/poker_policy.pt"):
