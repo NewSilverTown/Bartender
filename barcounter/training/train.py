@@ -303,7 +303,7 @@ if __name__ == "__main__":
         'learning_rate': 3e-4,
         'weight_decay': 1e-5,
         'buffer_size': 50000,
-        'batch_size': 1024,
+        'batch_size': 256,
         'gamma': 0.97,
         'clip_epsilon': 0.2,
         'value_coeff': 0.5,

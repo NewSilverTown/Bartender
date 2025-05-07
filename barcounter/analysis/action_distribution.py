@@ -16,7 +16,7 @@ from models.policy_net import PokerPolicyNet,StateEncoder, load_model
 from utils.game_simulator import PokerGame, ActionType
 
 class ActionDistributionAnalyzer:
-    def __init__(self, model_path="checkpoints/model_100.pt"):
+    def __init__(self, model_path="checkpoints/model_200.pt"):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # 游戏模拟器用于生成分析数据
