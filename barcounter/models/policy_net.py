@@ -26,44 +26,76 @@ class StateEncoder:
         """编码游戏状态为特征向量"""
         features = []
         
+        # 手牌潜力
+        features.append(self._hand_potential(game.players[player_idx].hand))
+
+        # 2. 对手激进指数（0-1）
+        opponent_aggression = sum(
+            p.current_bet for p in game.players 
+            if p != game.players[player_idx] and p.is_in_hand
+        ) / (game.pot + 1e-8)
+        features.append(opponent_aggression)
+
+        # 3. 位置优势（按钮位距离标准化）
+        position_advantage = (game.current_player - player_idx) % game.num_players
+        features.append(position_advantage / game.num_players)
+
+         # 4. 筹码深度（相对深度）
+        stack_ratio = game.players[player_idx].stack / sum(p.stack for p in game.players)
+        features.append(stack_ratio)
+
         # 玩家个人特征
-        player = game.players[player_idx]
-        features += [
-            player.stack / 1000.0,  # 归一化筹码
-            player.current_bet / 1000.0,
-            int(player.is_in_hand),
-            int(player.is_all_in)
-        ]
+        # player = game.players[player_idx]
+        # features += [
+        #     player.stack / 1000.0,  # 归一化筹码
+        #     player.current_bet / 1000.0,
+        #     int(player.is_in_hand),
+        #     int(player.is_all_in)
+        # ]
         
         # 手牌编码
-        hand_ranks = [self._card_rank(c) for c in player.hand]
-        features += sorted(hand_ranks, reverse=True)
+        # hand_ranks = [self._card_rank(c) for c in player.hand]
+        # features += sorted(hand_ranks, reverse=True)
         
         # 公共牌编码
-        community_ranks = [self._card_rank(c) for c in game.community_cards]
-        features += community_ranks + [0]*(5-len(community_ranks))  # 补齐5张
+        # community_ranks = [self._card_rank(c) for c in game.community_cards]
+        # features += community_ranks + [0]*(5-len(community_ranks))  # 补齐5张
         
         # 对手特征
-        for i in range(self.num_players):
-            if i == player_idx:
-                continue
-            opp = game.players[i]
-            features += [
-                opp.stack / 1000.0,
-                opp.current_bet / 1000.0,
-                int(opp.is_in_hand),
-                int(opp.is_all_in)
-            ]
+        # for i in range(self.num_players):
+        #     if i == player_idx:
+        #         continue
+        #     opp = game.players[i]
+        #     features += [
+        #         opp.stack / 1000.0,
+        #         opp.current_bet / 1000.0,
+        #         int(opp.is_in_hand),
+        #         int(opp.is_all_in)
+        #     ]
             
         # 回合信息
-        features += [
-            game.game_phase / 3.0,  # 归一化回合阶段
-            game.pot / 3000.0,
-            (game.current_player == player_idx)  # 是否当前玩家
-        ]
+        # features += [
+        #     game.game_phase / 3.0,  # 归一化回合阶段
+        #     game.pot / 3000.0,
+        #     (game.current_player == player_idx)  # 是否当前玩家
+        # ]
         
-        return torch.FloatTensor(features)
+        return torch.FloatTensor(features).float()
     
+    def _hand_potential(self, hand):
+        """评估手牌发展潜力（同花/顺子可能）"""
+        suits = [c[1] for c in hand]
+        ranks = sorted(['23456789TJQKA'.index(c[0]) for c in hand])
+        
+        # 同花潜力
+        flush_potential = 1.0 if len(set(suits)) == 1 else 0.3
+        
+        # 顺子潜力
+        gap = ranks[1] - ranks[0]
+        straight_potential = 1.0 if gap == 1 else (0.5 if gap == 2 else 0.2)
+        
+        return (flush_potential + straight_potential) / 2
+
     def _card_rank(self, card: str) -> float:
         """将卡牌转换为数值（2=0.0, A=1.0）"""
         rank_map = {'2':0.0, '3':0.1, '4':0.2, '5':0.3, '6':0.4,
@@ -164,9 +196,14 @@ class PokerPolicyNet(nn.Module):
             action_probs, raise_ratio, _ = self(state.unsqueeze(0), 
                                              legal_mask.unsqueeze(0))
         
-        action_probs = action_probs * legal_mask  # 二次屏蔽
-        action_probs = action_probs / action_probs.sum()  # 重新归一化
+        # action_probs = action_probs * legal_mask  # 二次屏蔽
+        action_probs = action_probs / (action_probs.sum() + 1e-8)  # 重新归一化
         
+        # 最低探索概率（新增）
+        min_prob = 0.05 / len(legal_actions)
+        action_probs = torch.clamp(action_probs, min=min_prob)
+        action_probs = action_probs / action_probs.sum()
+
         # 选择动作
         valid_probs = action_probs[0][legal_mask.bool()]
         valid_probs /= valid_probs.sum()

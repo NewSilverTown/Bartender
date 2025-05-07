@@ -37,6 +37,9 @@ class PPOTrainer:
             lr=config['learning_rate'],
             weight_decay=config['weight_decay']
         )
+
+        self.current_stage = 0  # 训练阶段控制
+        self.stage_thresholds = [500, 1000, 2000]  # 阶段切换步数
         
         # 经验缓冲区
         self.buffer = deque(maxlen=config['buffer_size'])
@@ -167,32 +170,40 @@ class PPOTrainer:
         # 存活奖励
         if player.is_in_hand:
             reward += 0.02
+
+        hand_streath = self.encoder._evaluate_hand_strength(player.hand)
+        reward += hand_streath * 0.5
             
         # 筹码变化
         reward += (player.stack - 1000) / 1000  # 初始筹码为1000
-        
+
         # 激进奖励
         if player.current_bet > 0:
-            bet_ratio = player.current_bet / (player.stack + player.current_bet + 1e-8)
-            reward += bet_ratio * 0.5
+            bet_ratio = player.current_bet / (self.game.pot + 1e-8)
+            reward += bet_ratio * 0.8
         
         if player.current_bet > prev_pot:
             reward += 0.3 * (player.current_bet - prev_pot) / 1000
 
         if self.game.is_terminal():
-            if player.stack > 1000:  # 初始筹码为1000
-                reward += (player.stack - 1000) / 500  # 胜利奖励系数提高
+            if player.stack > 1500:  # 初始筹码为1000
+                reward += 2.0 # 胜利奖励系数提高
+            elif player.stack > 1000:
+                reward += 1.0
             else:
-                reward -= (1000 - player.stack) / 1000  # 失败惩
+                reward -= (1000 - player.stack) / 500
         
+        if self.game.pot > 0 and player.is_in_hand:
+            pot_control = player.current_bet / self.game.pot
+            reward += pot_control * 0.3
+
         #--------------------------
         # 阶段奖励（鼓励参与）
         # --------------------------
-        if self.game.game_phase > 0:  # Flop之后
-            if player.is_in_hand:
-                reward += 0.1 * self.game.game_phase  # 越后期奖励越高
+        if player.is_in_hand and self.game.game_phase > 0:  # Flop之后
+            reward -= 0.1 * self.game.game_phase  # 越后期存活惩罚越高
 
-        return float(reward)
+        return np.clip(reward, -2.0, 2.0)
 
     def _process_episode(self, episode_data):
         """计算折扣回报"""
@@ -251,16 +262,16 @@ class PPOTrainer:
 if __name__ == "__main__":
     config = {
         'num_players': 6,
-        'learning_rate': 3e-4,
+        'learning_rate': 5e-5,
         'weight_decay': 1e-5,
         'buffer_size': 100000,
         'batch_size': 256,
-        'gamma': 0.99,
-        'clip_epsilon': 0.3,
+        'gamma': 0.97,
+        'clip_epsilon': 0.25,
         'value_coeff': 0.5,
-        'entropy_coeff': 0.1,
+        'entropy_coeff': 0.15,
         'max_grad_norm': 0.5,
-        'episodes_per_update': 50,
+        'episodes_per_update': 200,
         'max_updates': 500,
         'save_dir': "checkpoints",
         'save_interval': 100,
