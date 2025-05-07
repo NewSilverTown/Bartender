@@ -61,9 +61,6 @@ class PPOTrainer:
             lr=config['learning_rate'],
             weight_decay=config['weight_decay']
         )
-
-        self.current_stage = 0  # 训练阶段控制
-        self.stage_thresholds = [500, 1000, 2000]  # 阶段切换步数
         
         # 经验缓冲区
         self.buffer = deque(maxlen=config['buffer_size'])
