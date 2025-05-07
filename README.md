@@ -17,7 +17,7 @@ RAISE: 14.09%
 
 If you want to train your own model. You can changes these params: <br>
 
-```json
+```python
 config = {
         'num_players': 6,
         'learning_rate': 3e-4,
