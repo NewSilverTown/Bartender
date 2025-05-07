@@ -1,6 +1,7 @@
 import sys
 import os
 import random
+import traceback
 
 # 获取当前脚本的绝对路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -54,7 +55,10 @@ class PPOTrainer:
             input_dim=self.encoder.encode(self.game, 0).shape[0]
         ).to(self.device)
         self.policy_net = self.policy_net.float()
-        
+        self.training_step = 0  # 新增训练步数追踪
+        self.last_action_type = None
+        self.last_raise_amount = 0
+
         # 优化器和配置
         self.optimizer = optim.AdamW(
             self.policy_net.parameters(),
@@ -68,13 +72,15 @@ class PPOTrainer:
         # 创建模型保存目录
         os.makedirs(config['save_dir'], exist_ok=True)
 
-        assert self.policy_net.feature_net[0].in_features == self.encoder.encode(self.game, 0).shape[0], "状态编码维度与网络输入维度不匹配"
+        # assert self.policy_net.[0].in_features == self.encoder.encode(self.game, 0).shape[0], "状态编码维度与网络输入维度不匹配"
 
     def collect_experience(self):
         """收集多局游戏经验"""
         
         for _ in range(self.config['episodes_per_update']):
             self.game.reset()
+            self.last_action_type = None
+            self.last_raise_amount = 0
             episode_data = []
             done = False
             
@@ -101,7 +107,12 @@ class PPOTrainer:
                     legal_actions
                 )
                 
-                # 执行动作
+                self.last_action_type = action_type
+                if action_type == ActionType.RAISE:
+                    self.last_raise_amount = action_info.get('amount', 0)
+                else:
+                    self.last_raise_amount = 0
+                    # 执行动作
                 prev_pot = self.game.pot
                 self.game.apply_action(action_type, action_info.get('amount', 0))
                 reward = self._calculate_reward(current_player, prev_pot)
@@ -114,7 +125,8 @@ class PPOTrainer:
                     'action_idx': action_idx,  # 新增动作索引
                     'value': value[0].cpu(),
                     'reward': reward,
-                    'legal_actions': legal_actions
+                    'legal_actions': legal_actions,
+                    'training_step': self.training_step
                 })
             
             # 计算折扣回报
@@ -123,6 +135,12 @@ class PPOTrainer:
     def train(self):
         """训练循环"""
         for update in range(self.config['max_updates']):
+            self.training_step = update  # 更新当前训练步数
+            # 动态调整学习率
+            lr = self.config['learning_rate'] * (0.9 ** (update // 100))
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = lr
+            
             self.collect_experience()
             
             if len(self.buffer) < self.config['batch_size']:
@@ -144,7 +162,7 @@ class PPOTrainer:
             
             # 计算损失（修复gather参数）
             new_probs, _, new_values = self.policy_net(states.float())
-            
+
             # 正确使用gather方法
             ratio = (new_probs.gather(1, actions.unsqueeze(1)) / 
                 (old_probs.gather(1, actions.unsqueeze(1)) + 1e-8))
@@ -166,11 +184,27 @@ class PPOTrainer:
                         - self.config['entropy_coeff'] * entropy)
             
             # 反向传播
-            self.optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 
-                                         self.config['max_grad_norm'])
-            self.optimizer.step()
+            # self.optimizer.zero_grad()
+            # total_loss.backward()
+            # torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 
+            #                              self.config['max_grad_norm'])
+            # self.optimizer.step()
+                
+            # 计算KL散度约束
+            with torch.no_grad():
+                old_probs = old_probs.detach()
+                kl_div = F.kl_div(
+                    torch.log(new_probs + 1e-8), 
+                    old_probs, 
+                    reduction='batchmean'
+                )
+
+            if kl_div > 0.03:
+                kl_loss = kl_div * 0.1
+                self.optimizer.zero_grad()
+                # kl_loss.backward(retain_graph=True)
+                torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
+                self.optimizer.step()
             
             # 保存模型
             if update % self.config['save_interval'] == 0:
@@ -190,10 +224,10 @@ class PPOTrainer:
         
         # 存活奖励
         if player.is_in_hand:
-            reward += 0.02
+            reward += 0.005
 
         hand_streath = self.encoder._evaluate_hand_strength(player.hand)
-        reward += np.power(hand_streath, 2) * 2.0
+        reward += np.power(hand_streath, 1.5) * 1.5
             
         # 筹码变化
         reward += (player.stack - 1000) / 1000  # 初始筹码为1000
@@ -201,17 +235,56 @@ class PPOTrainer:
         # 激进奖励
         if player.current_bet > 0:
             bet_ratio = player.current_bet / (player.stack + 1e-8)
-            aggression_bonus = 0.5 * (1 + np.tanh(5*(bet_ratio - 0.3)))  # S型曲线奖励
+            aggression_bonus = 0.3 * (1 + np.tanh(5*(bet_ratio - 0.5)))  # S型曲线奖励
             reward += aggression_bonus
         
         # ===== 阶段惩罚机制 =====
         phase_penalty = {
-            0: 0.0,   # Pre-flop
-            1: 0.1,   # Flop
-            2: 0.2,   # Turn
-            3: 0.3    # River
+            0: 0.1,   # Pre-flop
+            1: 0.08,   # Flop
+            2: 0.05,   # Turn
+            3: 0.02   # River
         }[self.game.game_phase]
-        reward -= phase_penalty * int(player.is_in_hand)  # 后期存活惩罚
+        reward -= phase_penalty # 后期存活惩罚
+
+        safe_stack = max(player.stack, 1e-8)
+        last_action_type = getattr(self, 'last_action_type', None)
+        last_raise_amount = getattr(self, 'last_raise_amount', 0)
+
+        # 改进的加注奖励计算
+        if last_action_type == ActionType.RAISE:
+            try:
+                # 计算有效加注金额（考虑全下情况）
+                effective_raise = last_raise_amount - player.current_bet
+                raise_ratio = effective_raise / safe_stack
+                
+                # 使用sigmoid函数约束奖励范围
+                target_ratio = 0.4
+                ratio_diff = abs(raise_ratio - target_ratio)
+                reward += 0.3 * (2 / (1 + np.exp(5 * ratio_diff)))- 0.15  # 峰值在0.4处
+            except Exception as e:
+                print(f"加注奖励计算异常: {str(e)}")
+                traceback.print_exc()
+
+        # 调整ALL_IN惩罚为非线性
+        if last_action_type == ActionType.ALL_IN and player.stack > 0:
+            pot_ratio = player.stack / (self.game.pot + 1e-8)
+            penalty = 2.0 * np.exp(-5 * pot_ratio)  # 高风险时惩罚更大
+            # print(f"Allin reward", reward)
+            reward -= penalty
+        elif last_action_type == ActionType.ALL_IN and player.stack <= 0:
+            phase_reward = {
+                0: -0.5,  # Pre-flop全下惩罚
+                1: -0.2,  # Flop
+                2: 0.1,   # Turn
+                3: 0.3    # River
+            }[self.game.game_phase]
+            reward += phase_reward
+
+        # 动作多样性奖励（需要action_probs）
+        if hasattr(self, 'last_action_probs'):
+            entropy = -sum(p * np.log(p + 1e-8) for p in self.last_action_probs.values())
+            reward += 0.1 * entropy  # 鼓励概率分布分散
 
         # ===== 对手建模奖励 =====
         opponent_fold_rate = sum(1 for p in self.game.players if not p.is_in_hand) / self.game.num_players
@@ -223,10 +296,10 @@ class PPOTrainer:
         if self.game.is_terminal():
             if player.stack > 1000:
                 win_margin = (player.stack - 1000) / 1000
-                reward += 3.0 * (1 + np.log1p(win_margin))  # 对数增长奖励
+                reward += 1.2 * np.log1p(win_margin)
             else:
                 loss_penalty = (1000 - player.stack) / 500
-                reward -= 2.0 * np.sqrt(loss_penalty)  # 平方根增强惩罚
+                reward -= 2.5 * (1 - np.exp(-loss_penalty))  # 平方根增强惩罚
         
         if self.game.pot > 0 and player.is_in_hand:
             pot_control = player.current_bet / self.game.pot
@@ -238,7 +311,14 @@ class PPOTrainer:
         if player.is_in_hand and self.game.game_phase > 0:  # Flop之后
             reward -= 0.1 * self.game.game_phase  # 越后期存活惩罚越高
 
-        return np.clip(reward, -3.0, 3.0)
+        return np.clip(reward, -2.5, -2.5)
+
+    def _get_current_action_type(self):
+        """辅助方法：获取当前动作类型"""
+        # 根据最近的episode_data获取最后一个动作
+        if self.last_action_type:
+            return self.last_action_type
+        return ActionType.FOLD  # 默认值
 
     def _process_episode(self, episode_data):
         """计算折扣回报"""
@@ -274,8 +354,7 @@ class PPOTrainer:
         # 处理加注金额
         action_info = {}
         if action_type == ActionType.RAISE:
-            legal_raise = next(a for a in valid_actions 
-                              if a['type'] == ActionType.RAISE)
+            legal_raise = next(a for a in valid_actions if a['type'] == ActionType.RAISE)
             min_raise = legal_raise['min']
             max_raise = legal_raise['max']
             amount = min_raise + (max_raise - min_raise) * raise_ratio
@@ -290,7 +369,7 @@ class PPOTrainer:
             'model_state': self.policy_net.state_dict(),
             'optimizer_state': self.optimizer.state_dict(),
             'step': step,
-            'input_dim': self.policy_net.feature_net[0].in_features  # 新增关键参数
+            'input_dim': self.encoder.encode(self.game, 0).shape[0]
         }, path)
         print(f"Saved model checkpoint at step {step}")
 
@@ -307,7 +386,7 @@ if __name__ == "__main__":
         'entropy_coeff': 0.1,
         'max_grad_norm': 0.5,
         'episodes_per_update': 50,
-        'max_updates': 500,
+        'max_updates': 1000,
         'save_dir': "checkpoints",
         'save_interval': 100,
         'log_interval': 10,

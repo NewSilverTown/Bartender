@@ -55,9 +55,13 @@ class StateEncoder:
         features.append(gto_deviation)
         
         # 6. 风险回报比
-        player = game.players[player_idx]
-        risk_reward = (game.pot - player.current_bet) / (player.stack + 1e-8)
-        features.append(np.tanh(risk_reward * 0.5))
+        remaining_stack = player.stack - player.current_bet
+        risk_reward = (game.pot - player.current_bet) / (remaining_stack + 1e-8)
+        features.append(np.tanh(risk_reward * 0.3))
+
+        # 添加筹码安全边际特征
+        stack_safety = remaining_stack / (game.pot + 1e-8)
+        features.append(np.clip(stack_safety, 0, 2))
 
         # 手牌潜力
         # features.append(self._hand_potential(game.players[player_idx].hand))
@@ -68,10 +72,6 @@ class StateEncoder:
         #     if p != game.players[player_idx] and p.is_in_hand
         # ) / (game.pot + 1e-8)
         # features.append(opponent_aggression)
-
-        # # 3. 位置优势（按钮位距离标准化）
-        # position_advantage = (game.current_player - player_idx) % game.num_players
-        # features.append(position_advantage / game.num_players)
 
         #  # 4. 筹码深度（相对深度）
         # stack_ratio = game.players[player_idx].stack / sum(p.stack for p in game.players)
@@ -112,6 +112,27 @@ class StateEncoder:
         #     game.pot / 3000.0,
         #     (game.current_player == player_idx)  # 是否当前玩家
         # ]
+
+        # 动态风险感知特征
+        pot_commit_ratio = player.current_bet / (game.pot + 1e-8)
+        features.append(np.tanh(pot_commit_ratio * 2))
+
+        # 对手激进指数（改进版）
+        active_opponents = [p for p in game.players if p.is_in_hand and p != player]
+        if active_opponents:
+            aggression = sum(p.current_bet for p in active_opponents) / len(active_opponents)
+            features.append(aggression / (game.pot + 1e-8))
+        else:
+            features.append(0.0)
+
+        # 位置优势（按钮位距离标准化）
+        button_distance = (game.current_player - player_idx) % game.num_players
+        position_weight = 1 - (button_distance / game.num_players)**0.5
+        features.append(position_weight)
+
+        # 有效筹码深度
+        effective_stack = min(player.stack, 2 * game.pot)
+        features.append(effective_stack / 1000)
         
         return torch.FloatTensor(features).float()
     
@@ -204,25 +225,43 @@ class PokerPolicyNet(nn.Module):
     """强化学习策略网络（兼容PokerGame）"""
     def __init__(self, input_dim=128):
         super().__init__()
-        self.feature_net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.LeakyReLU(),
-            nn.LayerNorm(256),
-            nn.Linear(256, 128),
-            nn.Tanh()
+        
+        self.input_dim = input_dim
+        # 可学习温度参数
+        self.temperature = nn.Parameter(torch.tensor([1.0]))
+
+       # 双流网络结构
+        self.hand_stream = nn.Sequential(
+            nn.Linear(input_dim//2, 64),
+            nn.ELU(),
+            nn.LayerNorm(64),
+            nn.Linear(64, 32)
+        )
+        
+        self.context_stream = nn.Sequential(
+            nn.Linear(input_dim//2, 64),
+            nn.ELU(),
+            nn.LayerNorm(64),
+            nn.Linear(64, 32)
+        )
+        
+        # 特征融合
+        self.fusion = nn.Sequential(
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2)
         )
         
         # 动作头
         self.action_head = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.ELU(),
-            nn.Linear(64, 4)  # 对应4种动作类型
+            nn.Linear(128, 4),
+            nn.Tanhshrink()
         )
         
-        # 加注金额预测（修复维度问题）
+        # 加注头
         self.raise_head = nn.Sequential(
-            nn.Linear(128, 1),  # 输出维度改为1
-            nn.Sigmoid()  # 输出0-1之间的比例
+            nn.Linear(128, 1),
+            nn.Sigmoid()
         )
         
         # 价值头
@@ -232,23 +271,33 @@ class PokerPolicyNet(nn.Module):
         )
 
     def forward(self, x, legal_mask=None):
-        x = self.feature_net(x)
+        # 分割输入特征
+        hand_feat = x[:, :self.input_dim//2]
+        context_feat = x[:, self.input_dim//2:]
         
+        # 双流处理
+        hand_out = self.hand_stream(hand_feat)
+        context_out = self.context_stream(context_feat)
+        
+        # 特征融合
+        fused = torch.cat([hand_out, context_out], dim=-1)
+        fused = self.fusion(fused)
+
         # 动作概率
-        action_logits = self.action_head(x)
+        action_logits = self.action_head(fused) / self.temperature
         if legal_mask is not None:
-            action_logits = action_logits + torch.log(legal_mask + 1e-6)
+            action_logits += torch.log(legal_mask + 1e-6)
         action_probs = F.softmax(action_logits, dim=-1)
         
-        # 加注比例（修复维度问题）
-        raise_ratio = self.raise_head(x).squeeze(-1)  # 压缩最后一个维度
+        # 加注比例
+        raise_ratio = self.raise_head(fused).squeeze(-1)
         
         # 状态价值
-        value = self.value_head(x)
+        value = self.value_head(fused)
         
         return action_probs, raise_ratio, value
 
-    def predict(self, game: PokerGame, player_idx: int) -> Dict:
+    def predict(self, game: PokerGame, player_idx: int,training_step: int = 0) -> Dict:
         """生成动作决策"""
         # 编码状态
         encoder = StateEncoder()
@@ -263,46 +312,45 @@ class PokerPolicyNet(nn.Module):
             if action['available']:
                 idx = action_types.index(action['type'])
                 legal_mask[idx] = 1.0
-            else:
-                #显式禁止不可用动作
-                idx = action_types.index(action['type'])
-                action_probs[0][idx] = 0.0  # 直接置零
         
         with torch.no_grad():
-            action_probs, raise_ratio, _ = self(state.unsqueeze(0), 
-                                             legal_mask.unsqueeze(0))
+            state_tensor = state.unsqueeze(0).to(next(self.parameters()).device)
+            legal_mask_tensor = legal_mask.unsqueeze(0).to(state_tensor.device)
+            action_probs, raise_ratio, _ = self(state_tensor, legal_mask_tensor)
         
-        # action_probs = action_probs * legal_mask  # 二次屏蔽
-        action_probs = action_probs / (action_probs.sum() + 1e-8)  # 重新归一化
+        # Gumbel-Softmax采样
+        logits = torch.log(action_probs + 1e-8)
+        adjusted_probs = F.gumbel_softmax(logits, tau=0.5, hard=False)
         
-        # 最低探索概率（新增）
-        min_prob = 0.05 / len(legal_actions)
-        action_probs = torch.clamp(action_probs, min=min_prob)
-        action_probs = action_probs / action_probs.sum()
-
-        # 选择动作
-        valid_probs = action_probs[0][legal_mask.bool()]
-        valid_probs /= valid_probs.sum()
-        selected_idx = torch.multinomial(valid_probs, 1).item()
+        # 动态探索率
+        min_prob = max(0.05, 0.2 * np.exp(-training_step / 10000))
         
-        # 映射回原始动作类型
-        action_type = action_types[legal_mask.nonzero()[selected_idx].item()]
+        # 应用探索下限
+        legal_mask = legal_mask.bool()
+        legal_indices = legal_mask.nonzero(as_tuple=True)[0]
+        legal_probs = adjusted_probs[0][legal_indices]
+        legal_probs = torch.clamp(legal_probs, min=min_prob)
+        legal_probs = legal_probs / legal_probs.sum()
         
-        # 构建动作信息
+        # 采样动作
+        selected_idx = torch.multinomial(legal_probs, 1).item()
+        action_type = action_types[legal_indices[selected_idx].item()]
+        
+        # 构建返回结果
         action_info = {
             'type': action_type,
             'raise_amount': 0,
             'probs': dict(zip([a.name for a in action_types], 
-                           action_probs[0].tolist()))
+                           adjusted_probs[0].tolist()))
         }
         
-        # 计算加注金额（修复维度问题）
+        # 计算加注金额
         if action_type == ActionType.RAISE:
-            min_raise = next(a['min'] for a in legal_actions 
-                          if a['type'] == ActionType.RAISE)
-            max_raise = next(a['max'] for a in legal_actions 
-                          if a['type'] == ActionType.RAISE)
-            ratio = raise_ratio[0].item()  # 现在可以正确获取标量值
+            legal_raise = next(a for a in legal_actions 
+                             if a['type'] == ActionType.RAISE)
+            min_raise = legal_raise['min']
+            max_raise = legal_raise['max']
+            ratio = raise_ratio[0].item()
             action_info['raise_amount'] = int(
                 min_raise + (max_raise - min_raise) * ratio
             )

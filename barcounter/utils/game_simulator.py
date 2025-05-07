@@ -161,10 +161,10 @@ class PokerGame:
         })
 
         # All-in逻辑
-        can_all_in = (player.stack > 0) and (player.stack > min_raise)
+        can_all_in = (player.stack > 0) and can_raise
         actions.append({
             'type': ActionType.ALL_IN,
-            'available': player.stack > 0,
+            'available': can_all_in,
             'min': player.stack,
             'max': player.stack
         })

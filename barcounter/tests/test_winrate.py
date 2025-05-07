@@ -69,7 +69,7 @@ class PokerAITester:
         """安全执行动作"""
         action_map = {
             0: ActionType.FOLD,
-            1: ActionType.CALL,
+            1: ActionType.CHECK_CALL,
             2: ActionType.RAISE,
             3: ActionType.ALL_IN
         }

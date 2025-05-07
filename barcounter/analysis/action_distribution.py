@@ -16,7 +16,7 @@ from models.policy_net import PokerPolicyNet,StateEncoder, load_model
 from utils.game_simulator import PokerGame, ActionType
 
 class ActionDistributionAnalyzer:
-    def __init__(self, model_path="checkpoints/model_200.pt"):
+    def __init__(self, model_path="checkpoints/model_900.pt"):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # 游戏模拟器用于生成分析数据
@@ -40,55 +40,55 @@ class ActionDistributionAnalyzer:
             'action_sequences': []
         }
     
-    def _get_legal_actions(self, game):
-        """从训练代码复制的合法动作生成逻辑"""
-        player = game.players[game.current_player]
-        actions = []
-        current_max_bet = max(p.current_bet for p in game.players)
-        call_amount = current_max_bet - player.current_bet
+    # def _get_legal_actions(self, game):
+    #     """从训练代码复制的合法动作生成逻辑"""
+    #     player = game.players[game.current_player]
+    #     actions = []
+    #     current_max_bet = max(p.current_bet for p in game.players)
+    #     call_amount = current_max_bet - player.current_bet
         
-        # Fold
-        actions.append({
-            'type': ActionType.FOLD,
-            'available': True,
-            'min': 0,
-            'max': 0
-        })
+    #     # Fold
+    #     actions.append({
+    #         'type': ActionType.FOLD,
+    #         'available': True,
+    #         'min': 0,
+    #         'max': 0
+    #     })
         
-        # Check/Call
-        can_call = (call_amount <= player.stack) and (call_amount >= 0)
-        actions.append({
-            'type': ActionType.CHECK_CALL,
-            'available': can_call,
-            'min': call_amount,
-            'max': call_amount
-        })
+    #     # Check/Call
+    #     can_call = (call_amount <= player.stack) and (call_amount >= 0)
+    #     actions.append({
+    #         'type': ActionType.CHECK_CALL,
+    #         'available': can_call,
+    #         'min': call_amount,
+    #         'max': call_amount
+    #     })
         
-        # Raise
-        min_raise = max(
-        game.big_blind,
-        current_max_bet + game.big_blind - player.current_bet
-        )
-        max_raise = player.stack
-        can_raise = (max_raise >= min_raise) and (player.stack > 0)
-        actions.append({
-            'type': ActionType.RAISE,
-            'available': can_raise,
-            'min': min_raise,
-            'max': max_raise,
-            'player_stack': player.stack
-        })
+    #     # Raise
+    #     min_raise = max(
+    #         game.big_blind,
+    #         current_max_bet + game.big_blind - player.current_bet
+    #     )
+    #     max_raise = player.stack
+    #     can_raise = (max_raise >= min_raise) and (player.stack > 0)
+    #     actions.append({
+    #         'type': ActionType.RAISE,
+    #         'available': can_raise,
+    #         'min': min_raise,
+    #         'max': max_raise,
+    #         'player_stack': player.stack
+    #     })
         
-        # All-in
-        can_all_in = (player.stack > 0) and not can_raise
-        actions.append({
-            'type': ActionType.ALL_IN,
-            'available': can_all_in,
-            'min': player.stack,
-            'max': player.stack
-        })
+    #     # All-in
+    #     can_all_in = (player.stack > 0) and not can_raise
+    #     actions.append({
+    #         'type': ActionType.ALL_IN,
+    #         'available': can_all_in,
+    #         'min': player.stack,
+    #         'max': player.stack
+    #     })
         
-        return [a for a in actions if a['available']]
+    #     return [a for a in actions if a['available']]
 
     def analyze(self, num_games=100):
         """执行分析主循环"""
@@ -114,7 +114,7 @@ class ActionDistributionAnalyzer:
                     state = self.encoder.encode(self.game, self.game.current_player)
                     legal_actions = self.game.get_legal_actions()  # 使用游戏自带方法
                     with torch.no_grad():
-                        action_info = self.model.predict(self.game, self.game.current_player)
+                        action_info = self.model.predict(self.game, self.game.current_player, 1000 - max_steps)
                 except Exception as e:
                     print(f"预测失败: {str(e)}")
                     break
