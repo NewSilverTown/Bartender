@@ -18,6 +18,30 @@ import torch.nn.functional as F
 from models.policy_net import PokerPolicyNet,StateEncoder
 from utils.game_simulator import PokerGame, ActionType
 
+class CurriculumOpponent:
+    def __init__(self, num_players):
+        self.stages = [
+            {'steps': 5000, 'fold_prob': 0.8, 'raise_prob': 0.1},
+            {'steps': 15000, 'fold_prob': 0.4, 'raise_prob': 0.3},
+            {'steps': 30000, 'fold_prob': 0.2, 'raise_prob': 0.5}
+        ]
+        self.current_stage = 0
+        self.num_players = num_players
+
+    def update_opponents(self, game, current_step):
+        """更新对手策略"""
+        # 确定当前阶段
+        while (self.current_stage < len(self.stages)-1 and 
+               current_step > self.stages[self.current_stage]['steps']):
+            self.current_stage += 1
+        
+        stage = self.stages[self.current_stage]
+        # 为每个对手设置策略
+        for i in range(1, self.num_players):
+            player = game.players[i]
+            player.fold_prob = stage['fold_prob']
+            player.raise_prob = stage['raise_prob']
+
 class PPOTrainer:
     def __init__(self, config):
         self.config = config
@@ -172,26 +196,40 @@ class PPOTrainer:
             reward += 0.02
 
         hand_streath = self.encoder._evaluate_hand_strength(player.hand)
-        reward += hand_streath * 0.5
+        reward += np.power(hand_streath, 2) * 2.0
             
         # 筹码变化
         reward += (player.stack - 1000) / 1000  # 初始筹码为1000
 
         # 激进奖励
         if player.current_bet > 0:
-            bet_ratio = player.current_bet / (self.game.pot + 1e-8)
-            reward += bet_ratio * 0.8
+            bet_ratio = player.current_bet / (player.stack + 1e-8)
+            aggression_bonus = 0.5 * (1 + np.tanh(5*(bet_ratio - 0.3)))  # S型曲线奖励
+            reward += aggression_bonus
         
+        # ===== 阶段惩罚机制 =====
+        phase_penalty = {
+            0: 0.0,   # Pre-flop
+            1: 0.1,   # Flop
+            2: 0.2,   # Turn
+            3: 0.3    # River
+        }[self.game.game_phase]
+        reward -= phase_penalty * int(player.is_in_hand)  # 后期存活惩罚
+
+        # ===== 对手建模奖励 =====
+        opponent_fold_rate = sum(1 for p in self.game.players if not p.is_in_hand) / self.game.num_players
+        reward += 0.4 * opponent_fold_rate  # 对手弃牌率越高，奖励越积极
+
         if player.current_bet > prev_pot:
             reward += 0.3 * (player.current_bet - prev_pot) / 1000
 
         if self.game.is_terminal():
-            if player.stack > 1500:  # 初始筹码为1000
-                reward += 2.0 # 胜利奖励系数提高
-            elif player.stack > 1000:
-                reward += 1.0
+            if player.stack > 1000:
+                win_margin = (player.stack - 1000) / 1000
+                reward += 3.0 * (1 + np.log1p(win_margin))  # 对数增长奖励
             else:
-                reward -= (1000 - player.stack) / 500
+                loss_penalty = (1000 - player.stack) / 500
+                reward -= 2.0 * np.sqrt(loss_penalty)  # 平方根增强惩罚
         
         if self.game.pot > 0 and player.is_in_hand:
             pot_control = player.current_bet / self.game.pot
@@ -203,7 +241,7 @@ class PPOTrainer:
         if player.is_in_hand and self.game.game_phase > 0:  # Flop之后
             reward -= 0.1 * self.game.game_phase  # 越后期存活惩罚越高
 
-        return np.clip(reward, -2.0, 2.0)
+        return np.clip(reward, -3.0, 3.0)
 
     def _process_episode(self, episode_data):
         """计算折扣回报"""
@@ -262,16 +300,16 @@ class PPOTrainer:
 if __name__ == "__main__":
     config = {
         'num_players': 6,
-        'learning_rate': 5e-5,
+        'learning_rate': 3e-4,
         'weight_decay': 1e-5,
-        'buffer_size': 100000,
-        'batch_size': 256,
+        'buffer_size': 50000,
+        'batch_size': 1024,
         'gamma': 0.97,
-        'clip_epsilon': 0.25,
+        'clip_epsilon': 0.2,
         'value_coeff': 0.5,
-        'entropy_coeff': 0.15,
+        'entropy_coeff': 0.1,
         'max_grad_norm': 0.5,
-        'episodes_per_update': 200,
+        'episodes_per_update': 50,
         'max_updates': 500,
         'save_dir': "checkpoints",
         'save_interval': 100,

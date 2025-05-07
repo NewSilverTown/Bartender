@@ -1,6 +1,7 @@
 import sys
 import torch
 import numpy as np
+from collections import defaultdict
 from pathlib import Path
 
 # 添加项目根目录到Python路径
@@ -17,32 +18,64 @@ from utils.game_simulator import ActionType, PokerGame
 
 class StateEncoder:
     """游戏状态编码器（兼容PokerGame类）"""
-    def __init__(self, num_players=6):
+    def __init__(self, num_players=6, history_length = 3):
         self.num_players = num_players
         self.hand_size = 2
         self.community_size = 5
+        self.history_length = history_length
+        self.prev_community_count = 0
+        self.opponent_action_history = defaultdict(list)
         
     def encode(self, game: PokerGame, player_idx: int) -> torch.Tensor:
         """编码游戏状态为特征向量"""
         features = []
+        player = game.players[player_idx]
+
+        # ===== 核心特征组 =====
+        # 1. 手牌矩阵编码（4x13 的 one-hot）
+        hand_matrix = self._create_hand_matrix(game.players[player_idx].hand)
+        features.extend(hand_matrix.flatten())
         
+        # 2. 公共牌演化模式（每阶段变化量）
+        phase_change = len(game.community_cards) - self.prev_community_count
+        features.append(phase_change / 3.0)
+        self.prev_community_count = len(game.community_cards)
+        
+        # 3. 筹码动力学特征
+        pot_ratio = game.pot / (sum(p.stack for p in game.players) + 1e-8)
+        features.append(pot_ratio)
+        
+        # 4. 对手行为时序特征（最近3步）
+        opp_actions = self._get_opponent_action_history(player_idx)
+        features.extend(opp_actions)
+        
+        # ===== 高级特征组 =====
+        # 5. GTO基准偏离度（需要预计算）
+        gto_deviation = self._calculate_gto_deviation(player.hand, game.community_cards)
+        features.append(gto_deviation)
+        
+        # 6. 风险回报比
+        player = game.players[player_idx]
+        risk_reward = (game.pot - player.current_bet) / (player.stack + 1e-8)
+        features.append(np.tanh(risk_reward * 0.5))
+
         # 手牌潜力
-        features.append(self._hand_potential(game.players[player_idx].hand))
+        # features.append(self._hand_potential(game.players[player_idx].hand))
 
-        # 2. 对手激进指数（0-1）
-        opponent_aggression = sum(
-            p.current_bet for p in game.players 
-            if p != game.players[player_idx] and p.is_in_hand
-        ) / (game.pot + 1e-8)
-        features.append(opponent_aggression)
+        # # 2. 对手激进指数（0-1）
+        # opponent_aggression = sum(
+        #     p.current_bet for p in game.players 
+        #     if p != game.players[player_idx] and p.is_in_hand
+        # ) / (game.pot + 1e-8)
+        # features.append(opponent_aggression)
 
-        # 3. 位置优势（按钮位距离标准化）
-        position_advantage = (game.current_player - player_idx) % game.num_players
-        features.append(position_advantage / game.num_players)
+        # # 3. 位置优势（按钮位距离标准化）
+        # position_advantage = (game.current_player - player_idx) % game.num_players
+        # features.append(position_advantage / game.num_players)
 
-         # 4. 筹码深度（相对深度）
-        stack_ratio = game.players[player_idx].stack / sum(p.stack for p in game.players)
-        features.append(stack_ratio)
+        #  # 4. 筹码深度（相对深度）
+        # stack_ratio = game.players[player_idx].stack / sum(p.stack for p in game.players)
+        # features.append(stack_ratio)
 
         # 玩家个人特征
         # player = game.players[player_idx]
@@ -58,8 +91,8 @@ class StateEncoder:
         # features += sorted(hand_ranks, reverse=True)
         
         # 公共牌编码
-        # community_ranks = [self._card_rank(c) for c in game.community_cards]
-        # features += community_ranks + [0]*(5-len(community_ranks))  # 补齐5张
+        community_ranks = [self._card_rank(c) for c in game.community_cards]
+        features += community_ranks + [0]*(5-len(community_ranks))  # 补齐5张
         
         # 对手特征
         # for i in range(self.num_players):
@@ -82,6 +115,15 @@ class StateEncoder:
         
         return torch.FloatTensor(features).float()
     
+    def _create_hand_matrix(self, hand):
+        """创建手牌矩阵（通道维度）"""
+        matrix = np.zeros((4, 13))  # 花色 x 牌面
+        for card in hand:
+            suit = {'h':0, 'd':1, 'c':2, 's':3}[card[1]]
+            rank = '23456789TJQKA'.index(card[0])
+            matrix[suit, rank] = 1
+        return matrix
+
     def _hand_potential(self, hand):
         """评估手牌发展潜力（同花/顺子可能）"""
         suits = [c[1] for c in hand]
@@ -123,6 +165,40 @@ class StateEncoder:
         if connected:
             strength += 0.2
         return strength
+
+    def _get_opponent_action_history(self, player_idx):
+        """获取对手最近动作（独热编码）"""
+        history = self.opponent_action_history[player_idx]
+        # 填充最近历史
+        while len(history) < self.history_length:
+            history.insert(0, [0]*4)  # 4种动作类型
+        # 取最近N次
+        recent = history[-self.history_length:]
+        return [v for entry in recent for v in entry]
+    
+    def _calculate_gto_deviation(self, hand, community):
+        """简单GTO偏离度计算"""
+        # 示例实现（需替换为真实GTO数据）
+        gto_ranges = {
+            'preflop': {
+                ('A', 'A'): 1.0,
+                ('K', 'K'): 0.95,
+                # ...其他手牌范围
+            },
+            # 其他阶段数据
+        }
+        current_phase = 'preflop' if len(community) == 0 else 'postflop'
+        hand_key = tuple(sorted([card[0] for card in hand], reverse=True))
+        return gto_ranges.get(current_phase, {}).get(hand_key, 0.5)
+    
+    def update_action_history(self, player_idx, action_type):
+        """更新对手动作历史"""
+        action_vec = [0]*4
+        action_vec[action_type.value] = 1
+        self.opponent_action_history[player_idx].append(action_vec)
+        # 保持历史长度
+        if len(self.opponent_action_history[player_idx]) > self.history_length:
+            self.opponent_action_history[player_idx].pop(0)
 
 class PokerPolicyNet(nn.Module):
     """强化学习策略网络（兼容PokerGame）"""
