@@ -16,7 +16,7 @@ from models.policy_net import PokerPolicyNet,StateEncoder, load_model
 from utils.game_simulator import PokerGame, ActionType
 
 class ActionDistributionAnalyzer:
-    def __init__(self, model_path="checkpoints/model_900.pt"):
+    def __init__(self, model_path="checkpoints/model_8000.pt"):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # 游戏模拟器用于生成分析数据
@@ -325,7 +325,7 @@ class ActionDistributionAnalyzer:
 
 if __name__ == "__main__":
     analyzer = ActionDistributionAnalyzer()
-    report = analyzer.analyze(num_games=500)
+    report = analyzer.analyze(num_games=1000)
     analyzer.plot_distributions(report)
     
     # 打印关键指标

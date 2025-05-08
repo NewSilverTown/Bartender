@@ -357,11 +357,11 @@ class PokerPolicyNet(nn.Module):
             
         return action_info
 
-def save_model(model, path="models/poker_policy.pt"):
+def save_model(model, input_dim, path="models/poker_policy.pt"):
     """保存模型"""
     torch.save({
         'model_state': model.state_dict(),
-        'input_dim': model.feature_net[0].in_features
+        'input_dim': input_dim
     }, path)
 
 def load_model(path="models/poker_policy.pt", device='cpu'):

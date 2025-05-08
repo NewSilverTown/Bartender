@@ -355,6 +355,8 @@ class PPOTrainer:
         action_info = {}
         if action_type == ActionType.RAISE:
             legal_raise = next(a for a in valid_actions if a['type'] == ActionType.RAISE)
+            if not legal_raise:
+                raise ValueError(f"RAISE 动作不可用，但被模型选择。合法动作: {valid_actions}")
             min_raise = legal_raise['min']
             max_raise = legal_raise['max']
             amount = min_raise + (max_raise - min_raise) * raise_ratio
@@ -386,9 +388,9 @@ if __name__ == "__main__":
         'entropy_coeff': 0.1,
         'max_grad_norm': 0.5,
         'episodes_per_update': 50,
-        'max_updates': 1000,
+        'max_updates': 10000,
         'save_dir': "checkpoints",
-        'save_interval': 100,
+        'save_interval': 2000,
         'log_interval': 10,
         'input_dim': 128    
     }

@@ -25,6 +25,7 @@ class PokerGame:
         self.big_blind = big_blind
         self.players = [Player() for _ in range(num_players)]
         self.reset()  # 使用reset方法初始化
+        self.available_actions = []
 
     def reset(self):
         """完整重置游戏状态"""
@@ -34,6 +35,7 @@ class PokerGame:
         self.game_phase = 0
         self.pot = 0
         self.current_player = 0
+        self.available_actions = []
         
         for p in self.players:
             p.hand = []
@@ -169,7 +171,33 @@ class PokerGame:
             'max': player.stack
         })
 
-        return [a for a in actions if a['available']]
+        if len(self.available_actions) > 0:
+            available_actions_map = {
+                action['type']: action
+                for action in self.available_actions
+            }
+
+            # 分步筛选
+            valid_actions = []
+            for action in actions:
+                # 第一步：检查是否 available 为 True
+                if not action.get('available', False):
+                    continue
+                    
+                # 第二步：检查是否存在同类型的可用动作
+                action_type = action.get('type')
+                matched_action = available_actions_map.get(action_type)
+                
+                if matched_action:
+                    # 返回 available_actions 中的完整对象
+                    valid_actions.append(matched_action)
+                    
+            return valid_actions
+
+        return [
+            action for action in actions 
+            if action.get("available", False)
+        ]
 
     def apply_action(self, action_type: ActionType, raise_amount: int = 0):
         player = self.players[self.current_player]
