@@ -202,26 +202,26 @@ class ActionDistributionAnalyzer:
         stack_level = min(2, player.stack // 500)  # 0-500, 500-1000, 1000+
         self.stats['stack_level_stats'][stack_level][action_type.name] += 1
 
-    def _execute_action(self, action):
-        """执行动作的简化版本"""
-        try:
-            # 执行前备份当前玩家索引
-            prev_player = self.game.current_player
+    # def _execute_action(self, action):
+    #     """执行动作的简化版本"""
+    #     try:
+    #         # 执行前备份当前玩家索引
+    #         prev_player = self.game.current_player
             
-            if action['type'] == ActionType.RAISE:
-                self.game.apply_action(action['type'], raise_amount=action['amount'])
-            else:
-                self.game.apply_action(action['type'])
+    #         if action['type'] == ActionType.RAISE:
+    #             self.game.apply_action(action['type'], raise_amount=action['amount'])
+    #         else:
+    #             self.game.apply_action(action['type'])
             
-            # 验证玩家索引是否变化
-            if self.game.current_player == prev_player:
-                print("玩家索引未变化，强制推进")
-                self.game._advance_to_next_player()
+    #         # 验证玩家索引是否变化
+    #         if self.game.current_player == prev_player:
+    #             print("玩家索引未变化，强制推进")
+    #             self.game._advance_to_next_player()
                 
-        except Exception as e:
-            print(f"执行动作失败: {str(e)}")
-            # 强制推进玩家索引
-            self.game.force_terminate()
+    #     except Exception as e:
+    #         print(f"执行动作失败: {str(e)}")
+    #         # 强制推进玩家索引
+    #         self.game.force_terminate()
 
     def generate_report(self):
         """生成分析报告"""
