@@ -11,6 +11,8 @@ project_root = os.path.dirname(current_dir)
 # 将根目录添加到Python路径
 sys.path.append(project_root)
 
+model_path = os.path.join(os.path.dirname(__file__), "..", "checkpoints", "model_8000.pt")
+
 import torch
 from utils.game_simulator import PokerGame, ActionType
 from models.policy_net import PokerPolicyNet,StateEncoder, load_model
@@ -18,7 +20,7 @@ from models.policy_net import PokerPolicyNet,StateEncoder, load_model
 app = FastAPI()
 
 # 加载模型（启动时加载）
-model = load_model("checkpoints/model_8000.pt", device="cpu")
+model = load_model(model_path, device="cpu")
 
 class GameStateRequest(BaseModel):
     player_hand: list[str]

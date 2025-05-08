@@ -14,5 +14,5 @@ request_data = {
     "player_idx": 0
 }
 
-response = requests.post("http://localhost:8080/predict", json=request_data)
+response = requests.post("http://localhost:8000/predict", json=request_data)
 print(response.json())

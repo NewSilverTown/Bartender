@@ -1,2 +1,12 @@
 test_*.py
-.venv/*
+
+**/__pycache__
+**/*.pyc
+.git
+.venv
+tests
+training
+analysis
+Dockerfile
+.gitignore
+test_api.py
