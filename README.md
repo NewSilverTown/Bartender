@@ -98,3 +98,14 @@ Run Local server
 # Run api service to provide predict api
 python ./app/main.py
 ```
+
+Deployment
+
+```
+#bartenader folder
+docker build -t your_username/bartender:0.0.1 .
+docker push your_username/bartender:0.0.1 # you should login docker hub firstly
+docker pull your_username/bartender:0.0.1 # pull docker image in you cloud server
+
+docker run -d -p portnumber:portnumber --name bartender yourusername/bartender:0.0.1
+```
