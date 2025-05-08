@@ -18,7 +18,7 @@ from models.policy_net import PokerPolicyNet,StateEncoder, load_model
 app = FastAPI()
 
 # 加载模型（启动时加载）
-model = load_model("models/poker_policy.pt", device="cpu")
+model = load_model("checkpoints/model_8000.pt", device="cpu")
 
 class GameStateRequest(BaseModel):
     player_hand: list[str]

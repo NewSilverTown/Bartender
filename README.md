@@ -1,12 +1,15 @@
 # Bartender
-An AI texas poker robot
+Dependencies installation
+```python
+pip install
+```
 
 ```python
 #run command to start train
 python -m training.train
 
 #run command to collect action distribution
-python .\analysis\action_distribution.py
+python -m analysis.action_distribution
 ```
 
 SO far the probably of each action like follow:<br>
@@ -89,4 +92,9 @@ class PokerPolicyNet(nn.Module):
         )
 ...
 ```
-To be continued
+
+Run Local server
+```
+# Run api service to provide predict api
+python ./app/main.py
+```
