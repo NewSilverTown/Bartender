@@ -153,7 +153,12 @@ class PokerGame:
             current_max_bet + self.big_blind - player.current_bet
         )
         max_raise = player.stack
-        can_raise = (max_raise >= min_raise) and (player.stack > 0)
+        can_raise = (max_raise >= min_raise) and (player.stack > 0) and (max_raise > 0)
+
+        # 添加筹码不足检查
+        if (player.stack + player.current_bet) < min_raise:
+            can_raise = False
+
         actions.append({
             'type': ActionType.RAISE,
             'available': can_raise,

@@ -286,7 +286,7 @@ class PokerPolicyNet(nn.Module):
         # 动作概率
         action_logits = self.action_head(fused) / self.temperature
         if legal_mask is not None:
-            action_logits += torch.log(legal_mask + 1e-6)
+            action_logits = action_logits.masked_fill(legal_mask == 0, -1e8)
         action_probs = F.softmax(action_logits, dim=-1)
         
         # 加注比例

@@ -14,13 +14,14 @@ sys.path.append(str(project_root))
 import torch
 from models.policy_net import PokerPolicyNet,StateEncoder, load_model
 from utils.game_simulator import PokerGame, ActionType
+from utils.config_loader import ConfigLoader
 
 class ActionDistributionAnalyzer:
-    def __init__(self, model_path="checkpoints/model_8000.pt"):
+    def __init__(self, num_players=6, model_path="checkpoints/8_model_2000.pt"):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # 游戏模拟器用于生成分析数据
-        self.num_players = 6
+        self.num_players = num_players
         self.game = PokerGame(self.num_players)
 
         self.model = load_model(model_path).to(self.device)
@@ -324,7 +325,21 @@ class ActionDistributionAnalyzer:
         plt.show()
 
 if __name__ == "__main__":
-    analyzer = ActionDistributionAnalyzer()
+    config = ConfigLoader.load("config/agents.yaml", "ppo_config")
+    # 设置默认值保护
+    required_keys = ['num_players', 'learning_rate', 'batch_size']
+
+    for key in required_keys:
+        if key not in config:
+            raise KeyError(f"配置文件中缺少必需参数: {key}")
+    num_players = config['num_players']
+
+    model_path ="checkpoints/6_model_800.pt"
+    if num_players == 8:
+        model_path = "checkpoints/8_model_8000.pt"
+        
+
+    analyzer = ActionDistributionAnalyzer(num_players, model_path)
     report = analyzer.analyze(num_games=1000)
     analyzer.plot_distributions(report)
     

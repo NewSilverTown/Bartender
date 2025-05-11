@@ -18,6 +18,7 @@ from collections import deque,defaultdict
 import torch.nn.functional as F
 from models.policy_net import PokerPolicyNet,StateEncoder
 from utils.game_simulator import PokerGame, ActionType
+from utils.config_loader import ConfigLoader
 
 class CurriculumOpponent:
     def __init__(self, num_players):
@@ -45,10 +46,12 @@ class CurriculumOpponent:
 
 class PPOTrainer:
     def __init__(self, config):
+        self._validate_config(config)
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # 初始化环境和模型
+        self.player_count = config['num_players']
         self.game = PokerGame(num_players=config['num_players'])
         self.encoder = StateEncoder(num_players=config['num_players'])
         self.policy_net = PokerPolicyNet(
@@ -62,8 +65,8 @@ class PPOTrainer:
         # 优化器和配置
         self.optimizer = optim.AdamW(
             self.policy_net.parameters(),
-            lr=config['learning_rate'],
-            weight_decay=config['weight_decay']
+            lr= float(config['learning_rate']),
+            weight_decay= float(config['weight_decay'])
         )
         
         # 经验缓冲区
@@ -73,6 +76,20 @@ class PPOTrainer:
         os.makedirs(config['save_dir'], exist_ok=True)
 
         # assert self.policy_net.[0].in_features == self.encoder.encode(self.game, 0).shape[0], "状态编码维度与网络输入维度不匹配"
+
+    def _validate_config(self, config):
+        """验证配置完整性"""
+        required = [
+            'num_players', 'learning_rate', 'buffer_size',
+            'batch_size', 'gamma', 'clip_epsilon'
+        ]
+        for key in required:
+            if key not in config:
+                raise ValueError(f"训练配置缺少必需参数: {key}")
+                
+        # 类型检查示例
+        if not isinstance(config['num_players'], int):
+            raise TypeError("num_players必须为整数")
 
     def collect_experience(self):
         """收集多局游戏经验"""
@@ -107,6 +124,13 @@ class PPOTrainer:
                     legal_actions
                 )
                 
+                valid_actions = [a['type'] for a in legal_actions if a['available']]
+                if action_type not in valid_actions:
+                    print(f"非法动作检测! 步骤{self.training_step}")
+                    print(f"预测动作: {action_type}, 合法动作: {valid_actions}")
+                    print(f"动作概率: {action_probs}")
+                    raise ValueError("非法动作选择")
+
                 self.last_action_type = action_type
                 if action_type == ActionType.RAISE:
                     self.last_raise_amount = action_info.get('amount', 0)
@@ -137,7 +161,7 @@ class PPOTrainer:
         for update in range(self.config['max_updates']):
             self.training_step = update  # 更新当前训练步数
             # 动态调整学习率
-            lr = self.config['learning_rate'] * (0.9 ** (update // 100))
+            lr = float(self.config['learning_rate']) * (0.9 ** (update // 100))
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = lr
             
@@ -352,11 +376,16 @@ class PPOTrainer:
                       ActionType.RAISE, ActionType.ALL_IN][action_idx]
         
         # 处理加注金额
+        valid_types = [a['type'] for a in valid_actions]
+        if action_type not in valid_types:
+            raise ValueError(f"非法动作选择:{action_type}. 合法动作: {valid_types}.")
+
         action_info = {}
         if action_type == ActionType.RAISE:
-            legal_raise = next(a for a in valid_actions if a['type'] == ActionType.RAISE)
-            if not legal_raise:
+            legal_raises = [a for a in valid_actions if a['type'] == ActionType.RAISE]
+            if not legal_raises:
                 raise ValueError(f"RAISE 动作不可用，但被模型选择。合法动作: {valid_actions}")
+            legal_raise = legal_raises[0]
             min_raise = legal_raise['min']
             max_raise = legal_raise['max']
             amount = min_raise + (max_raise - min_raise) * raise_ratio
@@ -366,7 +395,7 @@ class PPOTrainer:
 
     def _save_model(self, step):
         """保存模型检查点"""
-        path = f"{self.config['save_dir']}/model_{step}.pt"
+        path = f"{self.config['save_dir']}/{self.player_count}_model_{step}.pt"
         torch.save({
             'model_state': self.policy_net.state_dict(),
             'optimizer_state': self.optimizer.state_dict(),
@@ -376,24 +405,15 @@ class PPOTrainer:
         print(f"Saved model checkpoint at step {step}")
 
 if __name__ == "__main__":
-    config = {
-        'num_players': 6,
-        'learning_rate': 3e-4,
-        'weight_decay': 1e-5,
-        'buffer_size': 50000,
-        'batch_size': 256,
-        'gamma': 0.97,
-        'clip_epsilon': 0.2,
-        'value_coeff': 0.5,
-        'entropy_coeff': 0.1,
-        'max_grad_norm': 0.5,
-        'episodes_per_update': 50,
-        'max_updates': 10000,
-        'save_dir': "checkpoints",
-        'save_interval': 2000,
-        'log_interval': 10,
-        'input_dim': 128    
-    }
-    
+
+
+    config = ConfigLoader.load("config/agents.yaml", "ppo_config")
+    # 设置默认值保护
+    required_keys = ['num_players', 'learning_rate', 'batch_size']
+
+    for key in required_keys:
+        if key not in config:
+            raise KeyError(f"配置文件中缺少必需参数: {key}")
+
     trainer = PPOTrainer(config)
     trainer.train()
