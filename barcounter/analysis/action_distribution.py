@@ -334,7 +334,7 @@ if __name__ == "__main__":
             raise KeyError(f"配置文件中缺少必需参数: {key}")
     num_players = config['num_players']
 
-    model_path ="checkpoints/6_model_800.pt"
+    model_path ="checkpoints/6_model_8000.pt"
     if num_players == 8:
         model_path = "checkpoints/8_model_8000.pt"
         

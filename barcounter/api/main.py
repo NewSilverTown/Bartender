@@ -12,7 +12,8 @@ project_root = os.path.dirname(current_dir)
 # 将根目录添加到Python路径
 sys.path.append(project_root)
 
-model_path = os.path.join(os.path.dirname(__file__), "..", "checkpoints", "model_8000.pt")
+model_for_8_players_path = os.path.join(os.path.dirname(__file__), "..", "checkpoints", "8_model_8000.pt")
+model_for_6_players_path = os.path.join(os.path.dirname(__file__), "..", "checkpoints", "6_model_8000.pt")
 
 import torch
 from utils.game_simulator import PokerGame, ActionType
@@ -21,7 +22,8 @@ from models.policy_net import PokerPolicyNet,StateEncoder, load_model
 app = FastAPI()
 
 # 加载模型（启动时加载）
-model = load_model(model_path, device="cpu")
+model_for_6_players = load_model(model_for_6_players_path, device="cpu")
+model_for_8_players = load_model(model_for_8_players_path, device="cpu")
 
 class GameStateRequest(BaseModel):
     player_hand: list[str]
@@ -31,6 +33,7 @@ class GameStateRequest(BaseModel):
     current_bet: int
     legal_actions: list[Dict[str, Any]]
     player_idx: int
+    num_players: int
 
 @app.post("/predict")
 async def predict_action(request: GameStateRequest):
@@ -39,7 +42,11 @@ async def predict_action(request: GameStateRequest):
         game = create_dummy_game(request)
         
         # 调用模型预测
-        action_info = model.predict(game, request.player_idx)
+        action_info = None
+        if request.num_players == 8:
+            action_info = model_for_8_players.predict(game, request.player_idx)
+        else:
+            action_info = model_for_6_players.predict(game, request.player_idx)
         
         print(f"actionInfo", action_info)
 
