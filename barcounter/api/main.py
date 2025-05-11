@@ -1,5 +1,6 @@
 import os
 import sys
+import traceback
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Dict, Any
@@ -40,12 +41,20 @@ async def predict_action(request: GameStateRequest):
         # 调用模型预测
         action_info = model.predict(game, request.player_idx)
         
-        return {
+        print(f"actionInfo", action_info)
+
+        response = {
             "action_type": action_info['type'].name,
             "raise_amount": action_info['raise_amount'],
             "probs": action_info['probs']
         }
+
+        print(f"response", response)
+
+        return response
     except Exception as e:
+        traceback.print_exc()
+        print(f"异常:", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 def create_dummy_game(request: GameStateRequest) -> PokerGame:
