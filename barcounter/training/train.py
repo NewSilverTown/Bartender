@@ -61,6 +61,7 @@ class PPOTrainer:
         self.training_step = 0  # 新增训练步数追踪
         self.last_action_type = None
         self.last_raise_amount = 0
+        self.initialChips = 1000.0
 
         # 优化器和配置
         self.optimizer = optim.AdamW(
@@ -250,17 +251,24 @@ class PPOTrainer:
         if player.is_in_hand:
             reward += 0.005
 
-        hand_streath = self.encoder._evaluate_hand_strength(player.hand)
-        reward += np.power(hand_streath, 1.5) * 1.5
+        hand_strength = self.encoder._evaluate_hand_strength(
+            player.hand, 
+            self.game.community_cards,
+            trials=100
+        )
+        phase_weights = [3.0, 4.0, 5.0, 6.0]
+        weight = phase_weights[self.game.game_phase]
+        strength_reward = weight * (hand_strength ** 2.5)
+        reward += strength_reward
             
         # 筹码变化
-        reward += (player.stack - 1000) / 1000  # 初始筹码为1000
+        stack_change = (player.stack - self.initialChips) / self.initialChips
+        reward += stack_change * 0.5
 
         # 激进奖励
         if player.current_bet > 0:
             bet_ratio = player.current_bet / (player.stack + 1e-8)
-            aggression_bonus = 0.3 * (1 + np.tanh(5*(bet_ratio - 0.5)))  # S型曲线奖励
-            reward += aggression_bonus
+            reward += 0.4 * np.tanh(bet_ratio * 3)
         
         # ===== 阶段惩罚机制 =====
         phase_penalty = {
@@ -275,35 +283,45 @@ class PPOTrainer:
         last_action_type = getattr(self, 'last_action_type', None)
         last_raise_amount = getattr(self, 'last_raise_amount', 0)
 
+        # 牌力一致性惩罚
+        action_strength = {
+            ActionType.FOLD: 0.1,
+            ActionType.CHECK_CALL: 0.3,
+            ActionType.RAISE: 0.6,
+            ActionType.ALL_IN: 0.8
+        }[self.last_action_type]
+        strength_diff = abs(hand_strength - action_strength)
+        reward -= 0.5 * strength_diff
+
         # 改进的加注奖励计算
-        if last_action_type == ActionType.RAISE:
-            try:
-                # 计算有效加注金额（考虑全下情况）
-                effective_raise = last_raise_amount - player.current_bet
-                raise_ratio = effective_raise / safe_stack
+        # if last_action_type == ActionType.RAISE:
+        #     try:
+        #         # 计算有效加注金额（考虑全下情况）
+        #         effective_raise = last_raise_amount - player.current_bet
+        #         raise_ratio = effective_raise / safe_stack
                 
-                # 使用sigmoid函数约束奖励范围
-                target_ratio = 0.4
-                ratio_diff = abs(raise_ratio - target_ratio)
-                reward += 0.3 * (2 / (1 + np.exp(5 * ratio_diff)))- 0.15  # 峰值在0.4处
-            except Exception as e:
-                print(f"加注奖励计算异常: {str(e)}")
-                traceback.print_exc()
+        #         # 使用sigmoid函数约束奖励范围
+        #         target_ratio = 0.4
+        #         ratio_diff = abs(raise_ratio - target_ratio)
+        #         reward += 0.3 * (2 / (1 + np.exp(5 * ratio_diff)))- 0.15  # 峰值在0.4处
+        #     except Exception as e:
+        #         print(f"加注奖励计算异常: {str(e)}")
+        #         traceback.print_exc()
 
         # 调整ALL_IN惩罚为非线性
-        if last_action_type == ActionType.ALL_IN and player.stack > 0:
-            pot_ratio = player.stack / (self.game.pot + 1e-8)
-            penalty = 2.0 * np.exp(-5 * pot_ratio)  # 高风险时惩罚更大
-            # print(f"Allin reward", reward)
-            reward -= penalty
-        elif last_action_type == ActionType.ALL_IN and player.stack <= 0:
-            phase_reward = {
-                0: -0.5,  # Pre-flop全下惩罚
-                1: -0.2,  # Flop
-                2: 0.1,   # Turn
-                3: 0.3    # River
-            }[self.game.game_phase]
-            reward += phase_reward
+        # if last_action_type == ActionType.ALL_IN and player.stack > 0:
+        #     pot_ratio = player.stack / (self.game.pot + 1e-8)
+        #     penalty = 2.0 * np.exp(-5 * pot_ratio)  # 高风险时惩罚更大
+        #     # print(f"Allin reward", reward)
+        #     reward -= penalty
+        # elif last_action_type == ActionType.ALL_IN and player.stack <= 0:
+        #     phase_reward = {
+        #         0: -0.5,  # Pre-flop全下惩罚
+        #         1: -0.2,  # Flop
+        #         2: 0.1,   # Turn
+        #         3: 0.3    # River
+        #     }[self.game.game_phase]
+        #     reward += phase_reward
 
         # 动作多样性奖励（需要action_probs）
         if hasattr(self, 'last_action_probs'):
@@ -315,14 +333,14 @@ class PPOTrainer:
         reward += 0.4 * opponent_fold_rate  # 对手弃牌率越高，奖励越积极
 
         if player.current_bet > prev_pot:
-            reward += 0.3 * (player.current_bet - prev_pot) / 1000
+            reward += 0.3 * (player.current_bet - prev_pot) / self.initialChips
 
         if self.game.is_terminal():
-            if player.stack > 1000:
-                win_margin = (player.stack - 1000) / 1000
+            if player.stack > self.initialChips:
+                win_margin = (player.stack - self.initialChips) / self.initialChips
                 reward += 1.2 * np.log1p(win_margin)
             else:
-                loss_penalty = (1000 - player.stack) / 500
+                loss_penalty = (self.initialChips - player.stack) / (self.initialChips/2)
                 reward -= 2.5 * (1 - np.exp(-loss_penalty))  # 平方根增强惩罚
         
         if self.game.pot > 0 and player.is_in_hand:
@@ -335,7 +353,7 @@ class PPOTrainer:
         if player.is_in_hand and self.game.game_phase > 0:  # Flop之后
             reward -= 0.1 * self.game.game_phase  # 越后期存活惩罚越高
 
-        return np.clip(reward, -2.5, -2.5)
+        return np.clip(reward, -2.0, -2.0)
 
     def _get_current_action_type(self):
         """辅助方法：获取当前动作类型"""
@@ -405,7 +423,6 @@ class PPOTrainer:
         print(f"Saved model checkpoint at step {step}")
 
 if __name__ == "__main__":
-
 
     config = ConfigLoader.load("config/agents.yaml", "ppo_config")
     # 设置默认值保护

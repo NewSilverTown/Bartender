@@ -1,7 +1,9 @@
 import sys
 import torch
 import numpy as np
+import random
 from collections import defaultdict
+from itertools import combinations
 from pathlib import Path
 
 # 添加项目根目录到Python路径
@@ -25,6 +27,9 @@ class StateEncoder:
         self.history_length = history_length
         self.prev_community_count = 0
         self.opponent_action_history = defaultdict(list)
+        self.rank_map = {'2':2, '3':3, '4':4, '5':5, '6':6, 
+                        '7':7, '8':8, '9':9, 'T':10, 
+                        'J':11, 'Q':12, 'K':13, 'A':14}
         
     def encode(self, game: PokerGame, player_idx: int) -> torch.Tensor:
         """编码游戏状态为特征向量"""
@@ -36,10 +41,25 @@ class StateEncoder:
         hand_matrix = self._create_hand_matrix(game.players[player_idx].hand)
         features.extend(hand_matrix.flatten())
         
+        # 手牌元特征 (6维)
+        ranks = sorted([self.rank_map[c[0]] for c in player.hand], reverse=True)
+        suited = int(player.hand[0][1] == player.hand[1][1])
+        gap = ranks[0] - ranks[1]
+        connector = int(gap <= 1)
+        hs_mc = self._evaluate_hand_strength(player.hand, game.community_cards)
+        features += [
+            ranks[0]/14.0,
+            ranks[1]/14.0,
+            suited,
+            connector,
+            min(gap/12.0, 1.0),
+            hs_mc
+        ]
+
         # 2. 公共牌演化模式（每阶段变化量）
         phase_change = len(game.community_cards) - self.prev_community_count
         features.append(phase_change / 3.0)
-        self.prev_community_count = len(game.community_cards)
+        # self.prev_community_count = len(game.community_cards)
         
         # 3. 筹码动力学特征
         pot_ratio = game.pot / (sum(p.stack for p in game.players) + 1e-8)
@@ -116,6 +136,8 @@ class StateEncoder:
         # 动态风险感知特征
         pot_commit_ratio = player.current_bet / (game.pot + 1e-8)
         features.append(np.tanh(pot_commit_ratio * 2))
+        effective_stack = min(player.stack, 2 * game.pot) / 1000.0
+        features.append(effective_stack)
 
         # 对手激进指数（改进版）
         active_opponents = [p for p in game.players if p.is_in_hand and p != player]
@@ -127,7 +149,7 @@ class StateEncoder:
 
         # 位置优势（按钮位距离标准化）
         button_distance = (game.current_player - player_idx) % game.num_players
-        position_weight = 1 - (button_distance / game.num_players)**0.5
+        position_weight = 1 - (button_distance / game.num_players)
         features.append(position_weight)
 
         # 有效筹码深度
@@ -166,26 +188,139 @@ class StateEncoder:
                    'J':0.85, 'Q':0.9, 'K':0.95, 'A':1.0}
         return rank_map.get(card[0], 0.0)
     
-    def _evaluate_hand_strength(self, hand):
+    def _evaluate_hand_strength(self, hand, community = []):
         """简单手牌强度评估"""
-        rank_values = {'2':0, '3':1, '4':2, '5':3, '6':4, 
-                      '7':5, '8':6, '9':7, 'T':8, 'J':9, 
-                      'Q':10, 'K':11, 'A':12}
-        ranks = sorted([rank_values[c[0]] for c in hand], reverse=True)
+        all_cards = hand + community
+        missing = 5-len(all_cards)
+        if missing <= 0:
+            return self._exact_strength(all_cards)
         
-        # 对子/同花/顺子潜力
-        is_pair = (ranks[0] == ranks[1])
-        suited = (hand[0][1] == hand[1][1])
-        connected = (abs(ranks[0] - ranks[1]) <= 1)
+        #蒙特卡洛采样
+        wins = 0
+        trials = 200
+        deck = self._create_deck()
+        existing = set(hand + community)
+        available = [c for c in deck if c not in existing]
+
+        for _ in range(trials):
+            sample = random.sample(available, missing)
+            my_hand = self._exact_strength(hand + community + sample)
+            opp_cards = [c for c in sample if c not in hand + community]
+            opp_hand = self._exact_strength(hand + community + sample)
+
+            if my_hand > opp_hand:
+                wins+=1
         
-        strength = 0.0
-        if is_pair:
-            strength += 0.5
-        if suited:
-            strength += 0.3
-        if connected:
-            strength += 0.2
-        return strength
+        return wins/trials
+        
+    def _create_deck(self):
+        """创建标准52张扑克牌"""
+        ranks = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A']
+        suits = ['h', 'd', 'c', 's']
+        return [r+s for s in suits for r in ranks]
+
+    def _exact_strength(self, cards):
+        """精确评估牌力（返回可比较的元组）"""
+        if len(cards) < 5:
+            return (0, [])  # 需要至少5张牌
+        
+        # 转换卡牌为数值
+        rank_map = {'2':2, '3':3, '4':4, '5':5, '6':6, '7':7, 
+                '8':8, '9':9, 'T':10, 'J':11, 'Q':12, 'K':13, 'A':14}
+        converted = []
+        for c in cards:
+            if len(c) != 2:  # 防止无效卡牌
+                continue
+            converted.append((rank_map[c[0]], c[1]))
+        
+        # 生成所有5张组合
+        best = None
+        for combo in combinations(converted, 5):
+            ranks = sorted([c[0] for c in combo], reverse=True)
+            suits = [c[1] for c in combo]
+            
+            # 计算牌型特征
+            flush = len(set(suits)) == 1
+            straight = (max(ranks) - min(ranks) == 4 and len(set(ranks)) == 5) 
+            straight_ace_low = set(ranks) == {14, 2, 3, 4, 5}
+            counts = {}
+            for r in ranks:
+                counts[r] = counts.get(r, 0) + 1
+            count_values = sorted(counts.values(), reverse=True)
+            unique_ranks = sorted(counts.keys(), reverse=True)
+            
+            # 牌型判断
+            if flush and (straight or straight_ace_low):
+                if straight and max(ranks) == 14:
+                    score = (9, [])  # 皇家同花顺
+                else:
+                    score = (8, [max(ranks)])  # 同花顺
+            elif 4 in count_values:
+                quad_rank = [r for r, cnt in counts.items() if cnt ==4][0]
+                kicker = [r for r in ranks if r != quad_rank][0]
+                score = (7, [quad_rank, kicker])
+            elif len(count_values) >=2 and count_values[0]==3 and count_values[1]==2:
+                trip_rank = [r for r, cnt in counts.items() if cnt ==3][0]
+                pair_rank = [r for r, cnt in counts.items() if cnt ==2][0]
+                score = (6, [trip_rank, pair_rank])
+            elif flush:
+                score = (5, sorted(ranks, reverse=True))
+            elif straight or straight_ace_low:
+                high = 5 if straight_ace_low else max(ranks)
+                score = (4, [high])
+            elif 3 in count_values:
+                trip_rank = [r for r, cnt in counts.items() if cnt ==3][0]
+                kickers = sorted([r for r in ranks if r != trip_rank], reverse=True)[:2]
+                score = (3, [trip_rank] + kickers)
+            elif len(count_values) >=2 and count_values[0]==2 and count_values[1]==2:
+                pairs = sorted([r for r, cnt in counts.items() if cnt ==2], reverse=True)[:2]
+                kicker = [r for r in ranks if r not in pairs][0]
+                score = (2, pairs + [kicker])
+            elif 2 in count_values:
+                pair_rank = [r for r, cnt in counts.items() if cnt ==2][0]
+                kickers = sorted([r for r in ranks if r != pair_rank], reverse=True)[:3]
+                score = (1, [pair_rank] + kickers)
+            else:
+                score = (0, sorted(ranks, reverse=True)[:5])
+            
+            if not best or score > best:
+                best = score
+        return best
+
+    def _evaluate_hand_strength(self, hand, community=[], trials=200):
+        """蒙特卡洛胜率评估"""
+        # 排除已存在的卡牌
+        all_cards = hand + community
+        existing = set(all_cards)
+        full_deck = self._create_deck()
+        remaining = [c for c in full_deck if c not in existing]
+        
+        wins = 0
+        needed = 5 - len(all_cards)
+        if needed <= 0:
+            return self._compare_hands(all_cards, [])  # 直接比较
+            
+        for _ in range(trials):
+            # 随机补牌
+            if len(remaining) < needed + 2:  # 需要至少给对手2张牌
+                continue
+            random.shuffle(remaining)
+            board = remaining[:needed]
+            my_hand = hand + community + board
+            
+            # 生成对手手牌
+            opp_cards = remaining[needed:needed+2]
+            opp_hand = opp_cards + community + board
+            
+            if self._compare_hands(my_hand, opp_hand) > 0:
+                wins += 1
+        
+        return wins / trials
+
+    def _compare_hands(self, hand1, hand2):
+        """比较两手牌的强度"""
+        return self._exact_strength(hand1) > self._exact_strength(hand2)
+
 
     def _get_opponent_action_history(self, player_idx):
         """获取对手最近动作（独热编码）"""
@@ -230,54 +365,51 @@ class PokerPolicyNet(nn.Module):
         # 可学习温度参数
         self.temperature = nn.Parameter(torch.tensor([1.0]))
 
-       # 双流网络结构
+        # 手牌注意力机制
+        self.hand_attention = nn.Sequential(
+            nn.Linear(52, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+
+       # 双流网络
         self.hand_stream = nn.Sequential(
-            nn.Linear(input_dim//2, 64),
-            nn.ELU(),
+            nn.Linear(52, 64),
             nn.LayerNorm(64),
+            nn.GELU(),
             nn.Linear(64, 32)
         )
         
         self.context_stream = nn.Sequential(
-            nn.Linear(input_dim//2, 64),
-            nn.ELU(),
+            nn.Linear(input_dim-52, 64),
             nn.LayerNorm(64),
+            nn.GELU(),
             nn.Linear(64, 32)
         )
         
         # 特征融合
         self.fusion = nn.Sequential(
             nn.Linear(64, 128),
-            nn.ReLU(),
-            nn.Dropout(0.2)
+            nn.LayerNorm(128),
+            nn.Dropout(0.3),
+            nn.GELU()
         )
         
-        # 动作头
-        self.action_head = nn.Sequential(
-            nn.Linear(128, 4),
-            nn.Tanhshrink()
-        )
-        
-        # 加注头
-        self.raise_head = nn.Sequential(
-            nn.Linear(128, 1),
-            nn.Sigmoid()
-        )
-        
-        # 价值头
-        self.value_head = nn.Sequential(
-            nn.Linear(128, 1),
-            nn.Tanh()
-        )
+         # 输出头
+        self.action_head = nn.Linear(128, 4)
+        self.raise_head = nn.Linear(128, 1)
+        self.value_head = nn.Linear(128, 1)
 
     def forward(self, x, legal_mask=None):
         # 分割输入特征
-        hand_feat = x[:, :self.input_dim//2]
-        context_feat = x[:, self.input_dim//2:]
+        hand_feat = x[:, :52]
+        attention = self.hand_attention(hand_feat)
+        enhanced_hand = hand_feat * attention
         
         # 双流处理
-        hand_out = self.hand_stream(hand_feat)
-        context_out = self.context_stream(context_feat)
+        hand_out = self.hand_stream(enhanced_hand)
+        context_out = self.context_stream(x[:, 52:])
         
         # 特征融合
         fused = torch.cat([hand_out, context_out], dim=-1)
@@ -290,7 +422,7 @@ class PokerPolicyNet(nn.Module):
         action_probs = F.softmax(action_logits, dim=-1)
         
         # 加注比例
-        raise_ratio = self.raise_head(fused).squeeze(-1)
+        raise_ratio = torch.sigmoid(self.raise_head(fused))
         
         # 状态价值
         value = self.value_head(fused)

@@ -41,56 +41,6 @@ class ActionDistributionAnalyzer:
             'action_sequences': []
         }
     
-    # def _get_legal_actions(self, game):
-    #     """从训练代码复制的合法动作生成逻辑"""
-    #     player = game.players[game.current_player]
-    #     actions = []
-    #     current_max_bet = max(p.current_bet for p in game.players)
-    #     call_amount = current_max_bet - player.current_bet
-        
-    #     # Fold
-    #     actions.append({
-    #         'type': ActionType.FOLD,
-    #         'available': True,
-    #         'min': 0,
-    #         'max': 0
-    #     })
-        
-    #     # Check/Call
-    #     can_call = (call_amount <= player.stack) and (call_amount >= 0)
-    #     actions.append({
-    #         'type': ActionType.CHECK_CALL,
-    #         'available': can_call,
-    #         'min': call_amount,
-    #         'max': call_amount
-    #     })
-        
-    #     # Raise
-    #     min_raise = max(
-    #         game.big_blind,
-    #         current_max_bet + game.big_blind - player.current_bet
-    #     )
-    #     max_raise = player.stack
-    #     can_raise = (max_raise >= min_raise) and (player.stack > 0)
-    #     actions.append({
-    #         'type': ActionType.RAISE,
-    #         'available': can_raise,
-    #         'min': min_raise,
-    #         'max': max_raise,
-    #         'player_stack': player.stack
-    #     })
-        
-    #     # All-in
-    #     can_all_in = (player.stack > 0) and not can_raise
-    #     actions.append({
-    #         'type': ActionType.ALL_IN,
-    #         'available': can_all_in,
-    #         'min': player.stack,
-    #         'max': player.stack
-    #     })
-        
-    #     return [a for a in actions if a['available']]
-
     def analyze(self, num_games=100):
         """执行分析主循环"""
         self.reset_stats()
@@ -203,26 +153,6 @@ class ActionDistributionAnalyzer:
         stack_level = min(2, player.stack // 500)  # 0-500, 500-1000, 1000+
         self.stats['stack_level_stats'][stack_level][action_type.name] += 1
 
-    # def _execute_action(self, action):
-    #     """执行动作的简化版本"""
-    #     try:
-    #         # 执行前备份当前玩家索引
-    #         prev_player = self.game.current_player
-            
-    #         if action['type'] == ActionType.RAISE:
-    #             self.game.apply_action(action['type'], raise_amount=action['amount'])
-    #         else:
-    #             self.game.apply_action(action['type'])
-            
-    #         # 验证玩家索引是否变化
-    #         if self.game.current_player == prev_player:
-    #             print("玩家索引未变化，强制推进")
-    #             self.game._advance_to_next_player()
-                
-    #     except Exception as e:
-    #         print(f"执行动作失败: {str(e)}")
-    #         # 强制推进玩家索引
-    #         self.game.force_terminate()
 
     def generate_report(self):
         """生成分析报告"""
@@ -334,7 +264,7 @@ if __name__ == "__main__":
             raise KeyError(f"配置文件中缺少必需参数: {key}")
     num_players = config['num_players']
 
-    model_path ="checkpoints/6_model_8000.pt"
+    model_path ="checkpoints/6_model_800.pt"
     if num_players == 8:
         model_path = "checkpoints/8_model_8000.pt"
         
